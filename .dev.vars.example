@@ -1,0 +1,4 @@
+# Copy to .dev.vars for local `wrangler dev`. Never commit the real file.
+BOT_TOKEN=123456:ABC-your-token-from-BotFather
+WEBHOOK_SECRET=any-long-random-string
+SETUP_KEY=another-long-random-string

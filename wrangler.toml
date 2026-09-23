@@ -1,0 +1,31 @@
+name = "amul-watch"
+main = "src/worker.js"
+compatibility_date = "2026-09-01"
+account_id = "6d2cf54c3cf43ddb1abfa18609be7c09"
+
+# Every minute, which is as often as Cloudflare will schedule a cron.
+# 1440 invocations/day against a 100k/day limit.
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+# private   = only ADMIN_CHAT_ID
+# allowlist = admin plus anyone added with /allow   <- start here
+# public    = anyone who finds the bot
+# Sweeps performed inside each firing. The Workers free plan caps CPU at 10ms
+# per invocation: one sweep measures ~8.8ms median, three measured ~25ms and
+# got a quarter of all firings killed. Leave this at 1 unless on Workers Paid.
+SWEEPS_PER_RUN = "1"
+
+ACCESS_MODE = "allowlist"
+
+# ADMIN_CHAT_ID is a secret, not a var, so it stays out of the repo:
+#   npx wrangler secret put ADMIN_CHAT_ID
+
+[[d1_databases]]
+binding = "DB"
+database_name = "amul-watch"
+database_id = "4e2e9993-ea54-41f4-a809-d642c4690492"
+
+[observability]
+enabled = true

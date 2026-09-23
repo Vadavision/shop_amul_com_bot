@@ -1,0 +1,17 @@
+{
+  "name": "amul-watch",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute amul-watch --remote --file=migrations/0001_init.sql",
+    "db:init:local": "wrangler d1 execute amul-watch --local --file=migrations/0001_init.sql",
+    "probe": "node scripts/probe.mjs",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.42.0"
+  }
+}
