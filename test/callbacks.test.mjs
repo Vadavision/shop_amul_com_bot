@@ -9,7 +9,7 @@
 import { test, before } from 'node:test'
 import assert from 'node:assert/strict'
 import { createEnv, telegram } from './support.mjs'
-import { handleUpdate } from '../src/bot.js'
+import { handleUpdate } from '../src/bot/index.js'
 
 const USER = { id: 1000001, is_bot: false, first_name: 'Test' }
 const CHAT = { id: 1000001, type: 'private' }
@@ -65,4 +65,40 @@ test('an unrecognised button says it is out of date and opens a working menu', a
     assert.match(answer.body.text, /out of date/, `"${unknown}" is explained, not silently ignored`)
     assert.equal(lastCall().method, 'sendMessage', `"${unknown}" hands over a fresh menu`)
   }
+})
+
+test('a watched product Amul delisted shows as no longer listed, not as sold out', async () => {
+  sqlite.prepare('DELETE FROM tracks').run()
+  sqlite.prepare('INSERT INTO tracks (chat_id, sku, name, created_at) VALUES (?, ?, ?, ?)').run(USER.id, 'GONE000001', 'Amul Discontinued Thing, 1 kg', Date.now())
+
+  telegram.length = 0
+  await message('/tracked')
+  const labels = buttons(lastCall()).map((b) => b.text)
+  assert.ok(labels.some((l) => l.startsWith('⚠️ No longer sold')), 'delisted item is labelled as such, visibly')
+  assert.ok(labels.every((l) => !l.startsWith('▫️ Discontinued')), 'and not dressed up as sold out')
+})
+
+test('tapping to watch a delisted product says so and tracks nothing', async () => {
+  sqlite.prepare('DELETE FROM tracks').run()
+  telegram.length = 0
+  await tap('t:GONE000001:l')
+  const answers = telegram.filter((c) => c.method === 'answerCallbackQuery')
+  assert.equal(answers.length, 1, 'Telegram accepts exactly one answer per tap')
+  assert.match(answers[0].body.text, /no longer listed/)
+  assert.deepEqual(tracked(), [])
+})
+
+test('the catalogue cache survives until the next ten-minute refresh', async () => {
+  const { getCatalog, putCatalog } = await import('../src/db.js')
+  await putCatalog(env, 'punjab', [{ sku: 'X' }])
+  sqlite.prepare('UPDATE catalog SET fetched_at = ? WHERE substore = ?').run(Date.now() - 11 * 60 * 1000, 'punjab')
+  assert.deepEqual(await getCatalog(env, 'punjab'), [{ sku: 'X' }], '11 minutes old is still served')
+})
+
+test('ACCESS_MODE is required', async () => {
+  const { env: unset } = createEnv({ ACCESS_MODE: undefined })
+  await assert.rejects(
+    handleUpdate(unset, { update_id: 1, message: { message_id: 1, from: USER, chat: CHAT, date: 0, text: '/start' } }),
+    /ACCESS_MODE must be one of/
+  )
 })

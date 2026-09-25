@@ -11,7 +11,7 @@ import assert from 'node:assert/strict'
 import { createEnv, telegram, sentTo } from './support.mjs'
 import { openSession, isInStock } from '../src/amul.js'
 import { runSweeps } from '../src/sweep.js'
-import { handleUpdate } from '../src/bot.js'
+import { handleUpdate } from '../src/bot/index.js'
 
 const USER = 1000001
 const ADMIN = 2000002

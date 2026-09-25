@@ -3,7 +3,7 @@
  * cron trigger. The work itself lives in sweep.js and bot.js.
  */
 import * as db from './db.js'
-import { handleUpdate, COMMANDS } from './bot.js'
+import { handleUpdate, COMMANDS } from './bot/index.js'
 import { setCommands } from './telegram.js'
 import { runCheck, runSweeps } from './sweep.js'
 

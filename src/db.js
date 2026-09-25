@@ -122,10 +122,20 @@ export async function putSnapshot(env, substore, map) {
     .run()
 }
 
+const ACCESS_MODES = new Set(['private', 'allowlist', 'public'])
+
+/**
+ * Whether this chat may use the bot. ACCESS_MODE is required: a missing or
+ * misspelt value used to fall back to "allowlist" silently, which for an
+ * intended "public" bot means turning every new user away without a trace.
+ */
 export async function isAllowed(env, chatId) {
-  const mode = (env.ACCESS_MODE ?? 'allowlist').toLowerCase()
+  const mode = env.ACCESS_MODE
+  if (!ACCESS_MODES.has(mode)) {
+    throw new Error(`ACCESS_MODE must be one of ${[...ACCESS_MODES].join(', ')}, got ${JSON.stringify(mode)}`)
+  }
   if (mode === 'public') return true
-  if (String(env.ADMIN_CHAT_ID ?? '') === String(chatId)) return true
+  if (String(env.ADMIN_CHAT_ID) === String(chatId)) return true
   if (mode === 'private') return false
   const row = await env.DB.prepare(
     'SELECT chat_id FROM allowlist WHERE chat_id = ?'
@@ -178,7 +188,10 @@ export async function trendingSkus(env, limit = 10) {
   return results ?? []
 }
 
-const CATALOG_TTL_MS = 3 * 60 * 1000
+// Longer than the sweep's ten-minute refresh, with room for a late one. At 3
+// minutes it expired seven minutes out of every ten, and each of those taps
+// paid for a live 2.5s fetch of the whole catalogue.
+const CATALOG_TTL_MS = 15 * 60 * 1000
 
 /** Cached catalogue for a substore, or null when missing or stale. */
 export async function getCatalog(env, substore, maxAgeMs = CATALOG_TTL_MS) {

@@ -5,10 +5,11 @@
  * against a stated start time, so an empty history reads as "nothing happened
  * since X" rather than implying a record that does not exist.
  */
-import * as db from './db.js'
-import { send, edit, keyboard, esc } from './telegram.js'
-import { normalizeName } from './format.js'
-import { formatIst } from './time.js'
+import * as db from '../db.js'
+import { keyboard, esc } from '../telegram.js'
+import { normalizeName } from '../format.js'
+import { formatIst } from '../time.js'
+import { show } from './ui.js'
 
 const EVENTS_PER_ITEM = 5
 
@@ -18,7 +19,7 @@ export async function showHistory(env, chatId, messageId, user) {
 
   if (!tracks.length) {
     const text = '📜 <b>Stock history</b>\n\nYou are not watching anything yet.'
-    return messageId ? edit(env, chatId, messageId, text, rows) : send(env, chatId, text, rows)
+    return show(env, chatId, messageId, text, rows)
   }
 
   const events = await db.stockHistory(env, user.substore, tracks.map((t) => t.sku))
@@ -46,6 +47,5 @@ export async function showHistory(env, chatId, messageId, user) {
 
   lines.push(`<i>Checked every minute. Recorded since ${esc(formatIst(loggingSince))}.</i>`)
 
-  const text = lines.join('\n')
-  return messageId ? edit(env, chatId, messageId, text, rows) : send(env, chatId, text, rows)
+  return show(env, chatId, messageId, lines.join('\n'), rows)
 }
