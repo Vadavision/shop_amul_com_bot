@@ -37,10 +37,10 @@ prompts. He gives you a token like `123456789:AAH...`.
 npx wrangler d1 create amul-watch
 ```
 
-Copy the `database_id` it prints into `wrangler.toml`, then create the tables:
+Copy the `database_id` it prints into `wrangler.toml`, then apply the migrations:
 
 ```bash
-npm run db:init
+npm run db:migrate
 ```
 
 ### 3. Add your secrets
@@ -96,6 +96,7 @@ Admin commands: `/stats`, `/allow <id>`, `/disallow <id>`.
 ## Development
 
 ```bash
+npm test                                # sweep + button tests, against live Amul stock
 node scripts/probe.mjs 380015 protein   # hit Amul directly, no Cloudflare
 npm run dev                             # local worker
 npm run tail                            # live production logs

@@ -9,6 +9,7 @@ import {
 import * as db from './db.js'
 import { send, edit, answerCallback, keyboard, esc } from './telegram.js'
 import { restockMessage, buyButtons } from './alert.js'
+import { showHistory } from './history.js'
 import {
   normalizeName,
   labelsFor,
@@ -32,6 +33,7 @@ export const COMMANDS = [
   { command: 'products', description: 'Browse everything' },
   { command: 'tracked', description: 'Show everything you are watching' },
   { command: 'check', description: 'Check stock right now' },
+  { command: 'history', description: 'When your items were last in stock' },
   { command: 'setpincode', description: 'Set your delivery area' },
   { command: 'pause', description: 'Pause alerts without losing your list' },
   { command: 'resume', description: 'Resume alerts' },
@@ -279,6 +281,8 @@ async function cmdHelp(env, chatId) {
       '',
       'The buttons under the keyboard are always there: your list, an instant stock check, full browsing, and changing your area.',
       '',
+      '/history shows when your items were last in stock.',
+      '',
       '<i>Unofficial. Not affiliated with Amul.</i>'
     ].join('\n'),
     { reply_markup: mainKeyboard() }
@@ -452,7 +456,8 @@ async function cmdTracked(env, chatId, messageId, user) {
       }
     ]
   })
-  rows.push([{ text: '⚡ Check now', callback_data: 'check' }, { text: '🗂 Browse all', callback_data: 'cats' }])
+  rows.push([{ text: '⚡ Check now', callback_data: 'check' }, { text: '📜 History', callback_data: 'hist' }])
+  rows.push([{ text: '🗂 Browse all', callback_data: 'cats' }])
   return messageId ? edit(env, chatId, messageId, text, keyboard(rows)) : send(env, chatId, text, keyboard(rows))
 }
 
@@ -506,6 +511,9 @@ async function handleCommand(env, msg, user) {
       if (!(await requirePincode(env, chatId, user))) return
       return showCategories(env, chatId, null, user)
     case 'tracked': return cmdTracked(env, chatId, null, user)
+    case 'history':
+      if (!(await requirePincode(env, chatId, user))) return
+      return showHistory(env, chatId, null, user)
     case 'check':
       if (!(await requirePincode(env, chatId, user))) return
       return cmdCheck(env, chatId, user)
@@ -590,6 +598,9 @@ async function handleCallback(env, cq, user) {
     case 'tracked':
       await answerCallback(env, cq.id)
       return cmdTracked(env, chatId, messageId, user)
+    case 'hist':
+      await answerCallback(env, cq.id)
+      return showHistory(env, chatId, messageId, user)
     case 'check':
       await answerCallback(env, cq.id, 'Checking…')
       return cmdCheck(env, chatId, user)

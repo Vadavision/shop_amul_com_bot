@@ -244,3 +244,42 @@ export async function putMeta(env, key, value) {
     .bind(key, String(value), Date.now())
     .run()
 }
+
+/**
+ * Append stock changes. `events` is [{ substore, sku, name, inStock, quantity }].
+ * Batched so one sweep costs one round trip however many products moved.
+ */
+export async function recordStockEvents(env, events, at = Date.now()) {
+  if (!events.length) return
+  const insert = env.DB.prepare(
+    `INSERT INTO stock_events (substore, sku, name, in_stock, quantity, at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  )
+  await env.DB.batch(
+    events.map((e) => insert.bind(e.substore, e.sku, e.name, e.inStock ? 1 : 0, e.quantity, at))
+  )
+}
+
+/** Most recent changes for some SKUs in one substore, newest first. */
+export async function stockHistory(env, substore, skus, limit = 50) {
+  if (!skus.length) return []
+  const placeholders = skus.map(() => '?').join(',')
+  const { results } = await env.DB.prepare(
+    `SELECT sku, name, in_stock, quantity, at FROM stock_events
+     WHERE substore = ? AND sku IN (${placeholders})
+     ORDER BY at DESC LIMIT ?`
+  )
+    .bind(substore, ...skus, limit)
+    .all()
+  return results ?? []
+}
+
+/** Tracks with the time each one started, for "since you started watching". */
+export async function listTracksWithSince(env, chatId) {
+  const { results } = await env.DB.prepare(
+    'SELECT sku, name, created_at FROM tracks WHERE chat_id = ? ORDER BY created_at DESC'
+  )
+    .bind(chatId)
+    .all()
+  return results ?? []
+}

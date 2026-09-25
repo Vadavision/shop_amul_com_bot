@@ -6,10 +6,11 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "db:init": "wrangler d1 execute amul-watch --remote --file=migrations/0001_init.sql",
-    "db:init:local": "wrangler d1 execute amul-watch --local --file=migrations/0001_init.sql",
     "probe": "node scripts/probe.mjs",
-    "tail": "wrangler tail"
+    "tail": "wrangler tail",
+    "test": "node --disable-warning=ExperimentalWarning --test 'test/*.test.mjs'",
+    "db:migrate": "wrangler d1 migrations apply amul-watch --remote",
+    "db:migrate:local": "wrangler d1 migrations apply amul-watch --local"
   },
   "devDependencies": {
     "wrangler": "^4.42.0"
