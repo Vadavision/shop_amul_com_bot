@@ -9,6 +9,7 @@ import { showStart, showHelp } from './home.js'
 import { showSearch, showCategories } from './browse.js'
 import { showWatchlist, showCheck, sendTestAlert } from './watchlist.js'
 import { showHistory } from './history.js'
+import { showLogin, removeLogin } from './login.js'
 
 /** The menu Telegram shows. Admin and diagnostic commands stay off it. */
 export const COMMANDS = [
@@ -58,6 +59,13 @@ export async function handleCommand(env, msg, user) {
       return send(env, chatId, '▶️ Alerts back on.', { reply_markup: mainKeyboard() })
     case 'whoami': return send(env, chatId, `Your Telegram chat ID is <code>${chatId}</code>`)
     case 'testalert': return sendTestAlert(env, chatId, user)
+
+    case 'amullogin':
+      if (!isAdmin(env, chatId)) return
+      return showLogin(env, msg, args)
+    case 'amullogout':
+      if (!isAdmin(env, chatId)) return
+      return removeLogin(env, chatId)
 
     case 'stats': {
       if (!isAdmin(env, chatId)) return

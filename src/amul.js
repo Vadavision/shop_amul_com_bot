@@ -60,6 +60,7 @@ export class AmulSession {
     this.tid = null
     this.storeVersion = DEFAULT_STORE_VERSION
     this.substore = null
+    this.account = null
   }
 
   #cookieHeader() {
@@ -133,6 +134,11 @@ export class AmulSession {
     if (!session.tid) throw new AmulError('No TID in session info', 'NO_TID')
     this.tid = session.tid
 
+    // Only set when the cookies belong to a signed-in customer. Just what the
+    // bot needs: the store the account shops in and the id of its cart.
+    const me = session.data
+    this.account = me?.isLoggedIn ? { firstName: me.first_name ?? '', store: me.store ?? null, cartId: me.cart_id ?? null } : null
+
     if (storeVersion) this.storeVersion = storeVersion
     else await this.#loadStoreVersion()
     return this
@@ -140,6 +146,13 @@ export class AmulSession {
 
   get version() {
     return this.storeVersion
+  }
+
+  /** A session that is signed in as the owner of this login cookie. */
+  static withLogin(jsessionid) {
+    const session = new AmulSession()
+    session.jar.set('jsessionid', jsessionid)
+    return session
   }
 
   /**
@@ -280,9 +293,9 @@ export class AmulSession {
    * Put a product in this session's cart and return the cart.
    *
    * `product` must be unslimmed (products({ raw: true })): the cart wants the
-   * product's `_id` and `seller`, which the stock check never needs. With no
-   * `cartId` Amul starts a cart; pass the id back to add to an existing one.
-   * Only ever adds — nothing here pays for anything.
+   * product's `_id` and `seller`, which the stock check never needs. Pass the
+   * customer's `cartId` to add to their cart; with none, Amul starts a guest
+   * cart. Only ever adds — nothing here pays for anything.
    */
   async addToCart(product, { quantity = 1, cartId = null } = {}) {
     const path = cartId ? `${cartId}/_/addItem` : '_/addItem'
@@ -351,17 +364,8 @@ export function isInStock(p) {
   return p.inventory_quantity >= p.inventory_low_stock_quantity
 }
 
-/**
- * A link that puts a cart in front of whoever opens it.
- *
- * Amul carts are plain records addressed by id, so a cart the bot built as a
- * guest can be picked up by any browser: this page merges the cart named in the
- * URL into the visitor's own, then lands on their cart. They sign in at
- * checkout, as they would for any order. No login or cookie of yours is held.
- */
-export function cartUrl(cartId) {
-  return `${SHOP}/en/cart/${cartId}/processing`
-}
+/** The signed-in customer's cart. Amul keeps it on their account, so any browser they log in on shows it. */
+export const CART_URL = `${SHOP}/en/cart`
 
 export function productUrl(p) {
   return `${SHOP}/en/product/${String(p.alias ?? '').replace(/ /g, '')}`

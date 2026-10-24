@@ -78,6 +78,27 @@ https://amul-watch.<your-subdomain>.workers.dev/setup?key=<SETUP_KEY>
 
 That registers the webhook and the command menu. Now message your bot `/start`.
 
+## Auto add to cart
+
+With `AUTO_CART = "1"`, when something **you** (the admin) watch comes back in
+stock, the bot also adds it to your Amul cart and puts an **Open cart &
+checkout** button on the alert. You log in on any browser and finish the order;
+the bot never pays.
+
+Amul only keeps a guest cart for the browser that made it, so the bot signs in
+as you instead:
+
+1. Log in at shop.amul.com on a computer, press F12 → Network, reload, click the
+   first `shop.amul.com` request, and copy the whole `cookie` request header.
+2. Send the bot `/amullogin <paste>`. It checks the cookie, saves it, and
+   deletes your message.
+
+`jsessionid` is HttpOnly, so no bookmarklet can read it; pasting is the way.
+Amul extends it a week each time it is used and the bot uses it at least every
+12 hours, so it lasts as long as the bot runs. If it dies you get a message.
+`/amullogout` forgets it. It is stored in D1 (`meta`), so treat the database
+like a password.
+
 ## Access control
 
 `ACCESS_MODE` in `wrangler.toml`:

@@ -15,6 +15,7 @@ import { AmulSession, openSession, isInStock } from './amul.js'
 import * as db from './db.js'
 import { send, editButtons, isUnreachable } from './telegram.js'
 import { restockMessage, buyButtons } from './alert.js'
+import { activeLogin, addToAccountCart, reportExpired, keepLoginAlive, LoginExpiredError } from './cart.js'
 import { sweepGap, reportGap, parseHealth, nextHealth, reportHealth } from './health.js'
 
 /**
@@ -156,7 +157,7 @@ export async function runCheck(env, state, sessions = new Map()) {
       // Alert only on sold out -> in stock. A first sighting is logged but
       // never announced, or adding something already in stock would page you.
       const restocked = changes.filter((p) => current[p.sku] === 1 && previous[p.sku] === 0)
-      if (restocked.length) summary.alerts += await notifyWatchers(env, substore, restocked, summary)
+      if (restocked.length) summary.alerts += await notifyWatchers(env, substore, restocked, summary, state)
 
       if (changes.length) {
         const merged = { ...previous, ...current }
@@ -195,7 +196,7 @@ export async function refreshCatalogs(env, state, sessions = new Map()) {
 }
 
 /** One message per user, however many of their items came back together. */
-async function notifyWatchers(env, substore, restocked, summary) {
+async function notifyWatchers(env, substore, restocked, summary, state) {
   const bySku = new Map(restocked.map((p) => [p.sku, p]))
   const watchers = await db.watchersFor(env, substore, [...bySku.keys()])
 
@@ -210,7 +211,8 @@ async function notifyWatchers(env, substore, restocked, summary) {
     try {
       const message = await send(env, chatId, restockMessage(items), buyButtons(items))
       sent++
-      if (env.AUTO_CART === '1') {
+      // Only the owner's own watches go in a cart: the cart is on their account.
+      if (env.AUTO_CART === '1' && activeLogin(state) && String(chatId) === String(env.ADMIN_CHAT_ID)) {
         summary.cartJobs.push({
           chatId,
           messageId: message?.message_id ?? null,
@@ -243,24 +245,28 @@ const parseJobs = (row) => {
 }
 
 /**
- * Put what just came back in stock into a guest cart, and give the alert a
- * button that opens it.
- *
- * Amul carts are records addressed by id, so the cart the bot builds here can
- * be opened from any browser (see cartUrl). Nothing is paid for and no account
- * is involved; the owner signs in at checkout like any other order.
+ * Put what just came back in stock into the owner's Amul cart, and give the
+ * alert a button that opens it. The cart is on their account, so it shows in
+ * whichever browser they are logged in on. Nothing is paid for.
  */
-async function buildCart(env, state, sessions, job) {
-  const { cartId, items } = await withSession(env, state, job.substore, sessions, async (session) => {
-    const items = (await session.products({ skus: job.skus, raw: true })).filter(isInStock)
-    let id = null
-    for (const product of items) id = (await session.addToCart(product, { cartId: id })).cart._id
-    return { cartId: id, items }
-  })
-  // Gone again before the cart could be built: the alert still has its buy links.
-  if (!cartId) return false
+async function buildCart(env, state, job) {
+  const login = activeLogin(state)
+  if (!login) return false
 
-  const buttons = buyButtons(items, cartId)
+  let items
+  try {
+    items = await addToAccountCart(state, login, job)
+  } catch (err) {
+    if (err instanceof LoginExpiredError) {
+      await reportExpired(env, state, login)
+      return false
+    }
+    throw err
+  }
+  // Gone again before the cart could be filled: the alert still has its buy links.
+  if (!items.length) return false
+
+  const buttons = buyButtons(items, { cart: true })
   if (job.messageId) {
     try {
       await editButtons(env, job.chatId, job.messageId, buttons)
@@ -269,12 +275,12 @@ async function buildCart(env, state, sessions, job) {
       // The message was deleted or is too old to edit; fall through to a new one.
     }
   }
-  await send(env, job.chatId, '🛒 <b>Your cart is ready</b>\n\nTap to review it and check out.', buttons)
+  await send(env, job.chatId, '🛒 <b>Added to your Amul cart</b>\n\nTap to review it and check out.', buttons)
   return true
 }
 
 /** Work through waiting cart jobs, returning the ones still to retry. */
-async function runCartJobs(env, state, sessions, jobs, totals) {
+async function runCartJobs(env, state, jobs, totals) {
   const now = Date.now()
   const keep = []
   let done = 0
@@ -286,8 +292,7 @@ async function runCartJobs(env, state, sessions, jobs, totals) {
     }
     done++
     try {
-      await buildCart(env, state, sessions, job)
-      totals.carts++
+      if (await buildCart(env, state, job)) totals.carts++
     } catch (err) {
       totals.errors.push(`cart for ${job.chatId}: ${err.message}`)
       keep.push({ ...job, tries: job.tries + 1 })
@@ -383,10 +388,18 @@ export async function runSweeps(env) {
   // Straight after the heartbeat: the alert is already out, and a cart that is
   // ready within a few seconds is worth more than a fresh catalogue.
   if (waiting.length) {
-    const remaining = await runCartJobs(env, state, sessions, waiting, totals)
+    const remaining = await runCartJobs(env, state, waiting, totals)
     if (JSON.stringify(remaining) !== JSON.stringify(waiting)) {
       await db.putMeta(env, 'cart_jobs', JSON.stringify(remaining))
     }
+  }
+
+  // Rarely does anything: a login that is used keeps itself alive, and one that
+  // has died should be found out now rather than at the next restock.
+  try {
+    await keepLoginAlive(env, state)
+  } catch (err) {
+    totals.errors.push(`amul login check: ${err.message}`)
   }
 
   // Last, and on its own: the heaviest thing a firing does.
