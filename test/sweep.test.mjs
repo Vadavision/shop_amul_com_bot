@@ -449,3 +449,69 @@ test('no cart is touched when AUTO_CART is off or the watcher has no login', asy
     assert.equal(edits().length, 0)
   }
 })
+
+// --- alerts Telegram refused --------------------------------------------------
+
+test('an alert Telegram refuses is resent next minute, marked late, never lost', async () => {
+  const { cartEnv, db2 } = await cartScenario({ login: false })
+  const realFetch = globalThis.fetch
+  // Telegram is rate-limiting this chat.
+  globalThis.fetch = async (url, options) =>
+    String(url).includes('api.telegram.org') && String(url).endsWith('/sendMessage')
+      ? Response.json({ ok: false, error_code: 429, description: 'Too Many Requests: retry after 5' })
+      : realFetch(url, options)
+  try {
+    const run = await runSweeps(cartEnv)
+    assert.equal(run.alerts, 0)
+    assert.match(run.errors.join(), /chat .*429/)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+  assert.equal(JSON.parse(db2.prepare('SELECT data FROM snapshots').get().data)[inStock.sku], 1, 'the restock is recorded, so no later check would see it again')
+  const queued = JSON.parse(db2.prepare("SELECT value FROM meta WHERE key = 'alert_retries'").get().value)
+  assert.equal(queued.length, 1, 'which is why the alert is kept')
+
+  telegram.length = 0
+  const next = await runSweeps(cartEnv)
+  assert.equal(next.alerts, 1, 'delivered on the next firing')
+  assert.match(sentTo(USER)[0].body.text, /Back in stock/)
+  assert.match(sentTo(USER)[0].body.text, /Telegram delayed this alert/, 'and it says it is late')
+  assert.equal(db2.prepare("SELECT value FROM meta WHERE key = 'alert_retries'").get().value, '[]')
+
+  telegram.length = 0
+  await runSweeps(cartEnv)
+  assert.equal(sentTo(USER).length, 0, 'sent once, not again')
+})
+
+test('an alert still undeliverable after 30 minutes is given up on, and says so', async () => {
+  const { cartEnv, db2 } = await cartScenario({ login: false })
+  db2.prepare('UPDATE snapshots SET data = ?').run(JSON.stringify({ [inStock.sku]: 1 }))
+  const old = Date.now() - 31 * 60 * 1000
+  db2.prepare("INSERT INTO meta (key, value, updated_at) VALUES ('alert_retries', ?, ?)").run(JSON.stringify([{ chatId: USER, substore: SUBSTORE, items: [inStock], at: old, tries: 30 }]), old)
+  const run = await runSweeps(cartEnv)
+  assert.match(run.errors.join(), /gave up on alert for chat/)
+  assert.equal(sentTo(USER).length, 0)
+  assert.equal(db2.prepare("SELECT value FROM meta WHERE key = 'alert_retries'").get().value, '[]')
+})
+
+test('a refused alert for a user with a login still gets its cart once delivered', async () => {
+  const { cartEnv } = await cartScenario()
+  const account = await fakeAccount()
+  const viaAccount = globalThis.fetch
+  let refuse = true
+  globalThis.fetch = async (url, options) =>
+    refuse && String(url).endsWith('/sendMessage')
+      ? Response.json({ ok: false, error_code: 502, description: 'Bad Gateway' })
+      : viaAccount(url, options)
+  try {
+    assert.equal((await runSweeps(cartEnv)).carts, 0, 'no alert, so no cart yet')
+    refuse = false
+    const next = await runSweeps(cartEnv)
+    assert.equal(next.alerts, 1)
+    assert.equal(next.carts, 1, 'the late alert gets its cart button too')
+  } finally {
+    globalThis.fetch = viaAccount
+    account.restore()
+  }
+  assert.equal(edits().length, 1)
+})

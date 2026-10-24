@@ -7,8 +7,9 @@
  */
 import { inventoryQuantity, productUrl, CART_URL } from './amul.js'
 import { esc, keyboard } from './telegram.js'
+import { formatIst } from './time.js'
 
-export function restockMessage(items, { test = false } = {}) {
+export function restockMessage(items, { test = false, spottedAt = null } = {}) {
   const lines = [
     test ? '🧪 <b>TEST ALERT</b> — this is what a restock looks like' : '',
     test ? '' : '',
@@ -27,6 +28,9 @@ export function restockMessage(items, { test = false } = {}) {
       ''
     )
   }
+
+  // A retried alert says how late it is, so nobody mistakes it for fresh stock.
+  if (spottedAt) lines.push(`<i>Spotted at ${formatIst(spottedAt)}; Telegram delayed this alert.</i>`, '')
 
   lines.push(
     test

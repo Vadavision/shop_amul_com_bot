@@ -40,6 +40,10 @@ const SESSION_TTL_MS = 15 * 60 * 1000
 // now and then instead of on every new session.
 const STORE_VERSION_TTL_MS = 6 * 60 * 60 * 1000
 
+// Sweeps in one firing are spread evenly over its minute, so with 2 a product is
+// looked at every 30s rather than twice in a burst and then not for a while.
+const MINUTE_MS = 60000
+
 // Finish comfortably inside the minute. If a firing ran long it would still be
 // sweeping when the next one starts, and two overlapping runs can read the same
 // snapshot and send the same restock alert twice.
@@ -53,6 +57,12 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const CART_JOB_TRIES = 3
 const CART_JOB_MAX_AGE_MS = 10 * 60 * 1000
 const CART_JOBS_PER_RUN = 2
+
+// A restock alert Telegram refused is kept and resent each minute, rather than
+// lost: by then the stock change is already recorded, so no later check would
+// notice it again. Given up on only after this long.
+const ALERT_RETRY_MAX_AGE_MS = 30 * 60 * 1000
+const ALERT_RETRIES_PER_RUN = 5
 
 const sessionKey = (substore) => `amul_session:${substore}`
 
@@ -120,7 +130,7 @@ const parseSnapshot = (text) => {
  * passes in the same firing need no more reads.
  */
 export async function runCheck(env, state, sessions = new Map()) {
-  const summary = { substores: state.watched.size, checked: 0, alerts: 0, changes: 0, catalog: false, errors: [], failed: [], cartJobs: [] }
+  const summary = { substores: state.watched.size, checked: 0, alerts: 0, changes: 0, catalog: false, errors: [], failed: [], cartJobs: [], alertRetries: [] }
 
   for (const [substore, skus] of state.watched) {
     try {
@@ -210,31 +220,68 @@ async function notifyWatchers(env, substore, restocked, summary) {
   const carts = env.AUTO_CART === '1' ? await db.chatsWithLogin(env, [...perUser.keys()]) : new Set()
 
   let sent = 0
+  const at = Date.now()
   for (const [chatId, items] of perUser) {
-    try {
-      const message = await send(env, chatId, restockMessage(items), buyButtons(items))
-      sent++
-      if (carts.has(String(chatId))) {
-        summary.cartJobs.push({
-          chatId,
-          messageId: message?.message_id ?? null,
-          substore,
-          skus: items.slice(0, 5).map((p) => p.sku),
-          at: Date.now(),
-          tries: 0
-        })
-      }
-    } catch (err) {
-      if (isUnreachable(err)) {
-        // Mark, never delete. The upstream bot deletes the user and every
-        // product they tracked here, which silently destroys watchlists.
-        await db.setBlocked(env, chatId, true)
-      } else {
-        summary.errors.push(`chat ${chatId}: ${err.message}`)
-      }
-    }
+    const result = await alertOne(env, { chatId, substore, items, at }, carts, summary)
+    if (result === 'sent') sent++
+    // Not sent and not unreachable: keep it, or this restock is gone for good.
+    if (result === 'retry') summary.alertRetries.push({ chatId, substore, items, at, tries: 1 })
   }
   return sent
+}
+
+/**
+ * Send one user their restock alert, and queue their cart if they have a login.
+ * Returns 'sent', 'gone' (they blocked the bot) or 'retry'.
+ */
+async function alertOne(env, { chatId, substore, items, at }, carts, summary, { late = false } = {}) {
+  try {
+    const message = await send(env, chatId, restockMessage(items, { spottedAt: late ? at : null }), buyButtons(items))
+    if (carts.has(String(chatId))) {
+      summary.cartJobs.push({
+        chatId,
+        messageId: message?.message_id ?? null,
+        substore,
+        skus: items.slice(0, 5).map((p) => p.sku),
+        at: Date.now(),
+        tries: 0
+      })
+    }
+    return 'sent'
+  } catch (err) {
+    if (isUnreachable(err)) {
+      // Mark, never delete. The upstream bot deletes the user and every
+      // product they tracked here, which silently destroys watchlists.
+      await db.setBlocked(env, chatId, true)
+      return 'gone'
+    }
+    summary.errors.push(`chat ${chatId}: ${err.message}`)
+    return 'retry'
+  }
+}
+
+/** Resend alerts Telegram refused earlier, returning the ones still to retry. */
+async function retryAlerts(env, retries, totals) {
+  const now = Date.now()
+  const live = retries.filter((r) => {
+    if (now - r.at <= ALERT_RETRY_MAX_AGE_MS) return true
+    totals.errors.push(`gave up on alert for chat ${r.chatId}: undeliverable for ${Math.round((now - r.at) / 60000)} min`)
+    return false
+  })
+  if (!live.length) return []
+
+  const carts = env.AUTO_CART === '1' ? await db.chatsWithLogin(env, live.map((r) => r.chatId)) : new Set()
+  const keep = []
+  for (const [i, retry] of live.entries()) {
+    if (i >= ALERT_RETRIES_PER_RUN) {
+      keep.push(retry)
+      continue
+    }
+    const result = await alertOne(env, retry, carts, totals, { late: true })
+    if (result === 'sent') totals.alerts++
+    if (result === 'retry') keep.push({ ...retry, tries: retry.tries + 1 })
+  }
+  return keep
 }
 
 const parseJobs = (row) => {
@@ -319,7 +366,7 @@ export async function runSweeps(env) {
   }
 
   const startedAt = Date.now()
-  const spacing = Math.floor(WINDOW_MS / sweeps)
+  const spacing = Math.floor(MINUTE_MS / sweeps)
   const sessions = new Map()
   const totals = { sweeps: 0, substores: 0, alerts: 0, changes: 0, carts: 0, catalog: false, errors: [] }
 
@@ -332,10 +379,12 @@ export async function runSweeps(env) {
 
   const failed = []
   const newJobs = []
+  const newRetries = []
   for (let i = 0; i < sweeps; i++) {
     if (i > 0) {
-      await sleep(spacing)
       // Amul can be slow; drop the remaining sweeps rather than overrun.
+      if (startedAt + i * spacing > startedAt + WINDOW_MS) break
+      await sleep(Math.max(0, startedAt + i * spacing - Date.now()))
       if (Date.now() - startedAt > WINDOW_MS) break
     }
 
@@ -347,6 +396,7 @@ export async function runSweeps(env) {
     totals.errors.push(...result.errors)
     failed.push(...result.failed)
     newJobs.push(...result.cartJobs)
+    newRetries.push(...result.alertRetries)
   }
 
   totals.elapsedMs = Date.now() - startedAt
@@ -383,19 +433,32 @@ export async function runSweeps(env) {
   // timestamp is direct evidence that sweeps are dying.
   const writes = [['last_sweep_ok', totals.elapsedMs]]
   if (health.changed) writes.push(['check_health', JSON.stringify(health.state)])
-  const waiting = [...parseJobs(state.meta.get('cart_jobs')), ...newJobs]
-  // Saved with the heartbeat, so a firing killed before the cart is built still
-  // leaves the job for the next one.
-  if (newJobs.length) writes.push(['cart_jobs', JSON.stringify(waiting)])
+  // Saved with the heartbeat, so a firing killed before they are done still
+  // leaves them for the next one.
+  const retries = [...parseJobs(state.meta.get('alert_retries')), ...newRetries]
+  if (newRetries.length) writes.push(['alert_retries', JSON.stringify(retries)])
+  const jobs = [...parseJobs(state.meta.get('cart_jobs')), ...newJobs]
+  if (newJobs.length) writes.push(['cart_jobs', JSON.stringify(jobs)])
   await db.putMetas(env, writes)
+  const savedRetries = newRetries.length ? JSON.stringify(retries) : (state.meta.get('alert_retries')?.value ?? '[]')
+  const savedJobs = newJobs.length ? JSON.stringify(jobs) : (state.meta.get('cart_jobs')?.value ?? '[]')
 
-  // Straight after the heartbeat: the alert is already out, and a cart that is
-  // ready within a few seconds is worth more than a fresh catalogue.
-  if (waiting.length) {
-    const remaining = await runCartJobs(env, state, waiting, totals)
-    if (JSON.stringify(remaining) !== JSON.stringify(waiting)) {
-      await db.putMeta(env, 'cart_jobs', JSON.stringify(remaining))
-    }
+  // First, any restock alert Telegram refused: a restock nobody has heard about
+  // is the one thing worse than a slow one.
+  if (retries.length) {
+    const late = { alerts: 0, errors: [], cartJobs: [] }
+    const remaining = await retryAlerts(env, retries, late)
+    totals.alerts += late.alerts
+    totals.errors.push(...late.errors)
+    jobs.push(...late.cartJobs)
+    if (JSON.stringify(remaining) !== savedRetries) await db.putMeta(env, 'alert_retries', JSON.stringify(remaining))
+  }
+
+  // Then carts: the alert is already out, and a cart that is ready within a
+  // few seconds is worth more than a fresh catalogue.
+  if (jobs.length) {
+    const remaining = await runCartJobs(env, state, jobs, totals)
+    if (JSON.stringify(remaining) !== savedJobs) await db.putMeta(env, 'cart_jobs', JSON.stringify(remaining))
   }
 
   // At most one login per firing, and only when one is due: a login that is

@@ -12,13 +12,12 @@ crons = ["* * * * *"]
 # private   = only ADMIN_CHAT_ID
 # allowlist = admin plus anyone added with /allow   <- start here
 # public    = anyone who finds the bot
-# Sweeps performed inside each firing. The Workers free plan caps CPU at 10ms
-# per invocation, and almost all of it is spent awaiting I/O. A check is one
-# batched D1 read, one Amul request on a saved session and one batched write;
-# the catalogue refresh runs after the heartbeat. Before that a sweep measured
-# ~9ms median and three sweeps got a quarter of all firings killed. Leave this
-# at 1 unless on Workers Paid.
-SWEEPS_PER_RUN = "1"
+# Sweeps performed inside each firing, spread evenly over the minute: 2 means a
+# product is looked at every 30s. The Workers free plan caps CPU at 10ms per
+# invocation. Measured live on 2026-10-24: 1 sweep ~5ms, 2 sweeps 6-8ms (each
+# extra sweep is one Amul request, ~2-3ms), so 3 would sit at the limit. Before
+# the session reuse a sweep cost ~9ms and 3 got a quarter of firings killed.
+SWEEPS_PER_RUN = "2"
 
 # 1 = users who opt in with /amullogin get restocked items added to their own
 # Amul cart, with an "Open cart & checkout" button on the alert. Logins are
