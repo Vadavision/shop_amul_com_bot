@@ -101,7 +101,7 @@ test('a catalogue refresh is logged the same way', async () => {
     JSON.stringify({ [inStock.sku]: 1, [soldOut.sku]: 1 }),
     SUBSTORE
   )
-  setMeta('last_catalog_ok', 1, Date.now() - 60 * 60 * 1000)
+  setMeta('last_catalog_ok', 1, Date.now() - 2 * 60 * 60 * 1000)
 
   const run = await runSweeps(env)
 

@@ -20,11 +20,16 @@ import { sweepGap, reportGap, parseHealth, nextHealth, reportHealth } from './he
 /**
  * How stale the browse/search catalogue may get before a sweep refreshes it.
  *
+ * The product list itself hardly changes, and it is the heaviest thing a
+ * firing does, so this is hourly. It is also what browse uses to sort in-stock
+ * items first, which is why it is not daily. db.js keeps the cache valid for
+ * longer than this, so a late refresh never sends a tap to a live fetch.
+ *
  * This used to be its own "*\/10" cron, but alongside the every-minute cron
  * Cloudflare never ran it — the branch was provably never entered — so the
  * sweep now decides when the catalogue is due and does it in-line.
  */
-const CATALOG_EVERY_MS = 10 * 60 * 1000
+const CATALOG_EVERY_MS = 60 * 60 * 1000
 
 // Amul's Cloudflare cookies last about half an hour; replace the session well
 // inside that rather than discovering it has expired through a failed check.

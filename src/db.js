@@ -178,10 +178,10 @@ export async function trendingSkus(env, limit = 10) {
   return results ?? []
 }
 
-// Longer than the sweep's ten-minute refresh, with room for a late one. At 3
-// minutes it expired seven minutes out of every ten, and each of those taps
-// paid for a live 2.5s fetch of the whole catalogue.
-const CATALOG_TTL_MS = 15 * 60 * 1000
+// Longer than the sweep's hourly refresh, with room for a late one. When this
+// was shorter than the refresh, each tap in the gap paid for a live 2.5s fetch
+// of the whole catalogue.
+const CATALOG_TTL_MS = 2 * 60 * 60 * 1000
 
 /** Cached catalogue for a substore, or null when missing or stale. */
 export async function getCatalog(env, substore, maxAgeMs = CATALOG_TTL_MS) {
