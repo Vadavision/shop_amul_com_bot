@@ -21,8 +21,11 @@ crons = ["* * * * *"]
 SWEEPS_PER_RUN = "1"
 
 # 1 = when an alert goes out, also put the restocked items in a guest cart and
-# add an "Open cart & checkout" button to it. No Amul login is involved.
-AUTO_CART = "1"
+# add an "Open cart & checkout" button to it. OFF: the button opens an empty
+# cart in any browser that already holds a cart, because Amul's merge-cart link
+# keeps the visitor's own cart and drops the bot's items. It also needs the
+# pincode set first or the site clears the cart. See the README before enabling.
+AUTO_CART = "0"
 
 ACCESS_MODE = "allowlist"
 
