@@ -4,12 +4,18 @@
  * Fetches once per substore, not once per user, so cost stays flat as the user
  * count grows. Only out-of-stock -> in-stock transitions notify; every change
  * in either direction is logged so "did it come back?" has a recorded answer.
+ *
+ * The free plan gives each firing 10ms of CPU, and nearly all of that goes on
+ * awaiting I/O, not on computing. So a check is built to await as little as
+ * possible: one batched D1 read, one request to Amul on a session kept from an
+ * earlier firing, one batched D1 write. The catalogue refresh, which is far
+ * heavier, runs after the heartbeat so it can never cost a check.
  */
-import { openSession, isInStock } from './amul.js'
+import { AmulSession, openSession, isInStock } from './amul.js'
 import * as db from './db.js'
 import { send, isUnreachable } from './telegram.js'
 import { restockMessage, buyButtons } from './alert.js'
-import { sweepGap, reportGap } from './health.js'
+import { sweepGap, reportGap, parseHealth, nextHealth, reportHealth } from './health.js'
 
 /**
  * How stale the browse/search catalogue may get before a sweep refreshes it.
@@ -20,6 +26,14 @@ import { sweepGap, reportGap } from './health.js'
  */
 const CATALOG_EVERY_MS = 10 * 60 * 1000
 
+// Amul's Cloudflare cookies last about half an hour; replace the session well
+// inside that rather than discovering it has expired through a failed check.
+const SESSION_TTL_MS = 15 * 60 * 1000
+
+// The store version is rediscovered by downloading a 184KB script, so do it
+// now and then instead of on every new session.
+const STORE_VERSION_TTL_MS = 6 * 60 * 60 * 1000
+
 // Finish comfortably inside the minute. If a firing ran long it would still be
 // sweeping when the next one starts, and two overlapping runs can read the same
 // snapshot and send the same restock alert twice.
@@ -27,33 +41,88 @@ const WINDOW_MS = 45000
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-/** One pass over every substore that has watchers. */
-export async function runCheck(env, sessions = new Map(), { refreshCatalog = false } = {}) {
-  const substores = await db.activeSubstores(env)
-  const storeVersion = Number(await db.getMeta(env, 'store_version')) || null
-  const summary = { substores: substores.length, checked: 0, alerts: 0, changes: 0, catalog: false, errors: [] }
+const sessionKey = (substore) => `amul_session:${substore}`
 
-  for (const substore of substores) {
+/** The session saved by an earlier firing, if it is still young enough. */
+function savedSession(state, substore) {
+  const row = state.meta.get(sessionKey(substore))
+  if (!row) return null
+  try {
+    const data = JSON.parse(row.value)
+    return Date.now() - data.at < SESSION_TTL_MS ? AmulSession.restore(data) : null
+  } catch {
+    return null
+  }
+}
+
+/** A brand-new session, saved so the next firings can skip opening one. */
+async function freshSession(env, state, substore) {
+  const version = state.meta.get('store_version')
+  const known = version && Date.now() - version.updated_at < STORE_VERSION_TTL_MS
+  const session = await openSession(substore, { storeVersion: known ? Number(version.value) : null })
+
+  const saved = JSON.stringify(session.export())
+  const entries = [[sessionKey(substore), saved]]
+  if (!known || String(session.version) !== version.value) entries.push(['store_version', session.version])
+  await db.putMetas(env, entries)
+  const now = Date.now()
+  for (const [key, value] of entries) state.meta.set(key, { value: String(value), updated_at: now })
+  return session
+}
+
+/**
+ * Run `work` on a session, replacing the session once if the first attempt
+ * fails. A saved session going stale is routine, and indistinguishable from
+ * Amul being down until a fresh one is tried.
+ */
+async function withSession(env, state, substore, sessions, work) {
+  const reused = sessions.get(substore) ?? savedSession(state, substore)
+  if (reused) {
     try {
-      // Only what someone is actually watching. Pulling the whole catalogue
-      // here cost 114KB and ~10ms of CPU per sweep, which on the free plan
-      // meant over half of all sweeps were killed mid-run.
-      const skus = await db.trackedSkus(env, substore)
-      if (!skus.length) continue
+      const result = await work(reused)
+      sessions.set(substore, reused)
+      return result
+    } catch {
+      sessions.delete(substore)
+    }
+  }
+  const session = await freshSession(env, state, substore)
+  const result = await work(session)
+  sessions.set(substore, session)
+  return result
+}
 
-      const products = refreshCatalog
-        ? await fetchViaCatalog(env, substore, skus, sessions, summary)
-        : await fetchWatched(substore, skus, sessions, storeVersion)
+const parseSnapshot = (text) => {
+  try {
+    return text ? JSON.parse(text) : {}
+  } catch {
+    return {}
+  }
+}
 
-      if (!products.length) {
-        summary.errors.push(`${substore}: no products returned for ${skus.length} skus`)
-        continue
-      }
+/**
+ * One pass over every substore that has watchers.
+ *
+ * `state` comes from db.loadState and is updated as the pass goes, so further
+ * passes in the same firing need no more reads.
+ */
+export async function runCheck(env, state, sessions = new Map()) {
+  const summary = { substores: state.watched.size, checked: 0, alerts: 0, changes: 0, catalog: false, errors: [], failed: [] }
+
+  for (const [substore, skus] of state.watched) {
+    try {
+      // Only what someone is actually watching: two products cost ~1.5KB, the
+      // whole catalogue 114KB.
+      const products = await withSession(env, state, substore, sessions, async (session) => {
+        const found = await session.products({ skus })
+        if (!found.length) throw new Error(`no products returned for ${skus.length} skus`)
+        return found
+      })
       summary.checked += products.length
 
       // No snapshot yet is a real state (first sweep for this substore), not
       // missing data: everything seen is a first sighting.
-      const previous = (await db.getSnapshot(env, substore)) ?? {}
+      const previous = parseSnapshot(state.snapshots.get(substore))
       const current = {}
       for (const p of products) current[p.sku] = isInStock(p) ? 1 : 0
 
@@ -77,10 +146,15 @@ export async function runCheck(env, sessions = new Map(), { refreshCatalog = fal
       const restocked = changes.filter((p) => current[p.sku] === 1 && previous[p.sku] === 0)
       if (restocked.length) summary.alerts += await notifyWatchers(env, substore, restocked, summary)
 
-      if (changes.length) await db.putSnapshot(env, substore, { ...previous, ...current })
+      if (changes.length) {
+        const merged = { ...previous, ...current }
+        await db.putSnapshot(env, substore, merged)
+        state.snapshots.set(substore, JSON.stringify(merged))
+      }
     } catch (err) {
       sessions.delete(substore)
       summary.errors.push(`${substore}: ${err.message}`)
+      summary.failed.push({ substore, error: err.message })
     }
   }
 
@@ -88,32 +162,24 @@ export async function runCheck(env, sessions = new Map(), { refreshCatalog = fal
 }
 
 /**
- * The full catalogue, fetched once and used twice: browse/search get a fresh
- * cache, and restock detection reads the watched subset out of the same
- * response instead of making a second request. This also does the full
- * bootstrap, which is where the store version is rediscovered for the cheap
- * sweeps to reuse.
+ * Refresh the browse/search catalogue of every watched substore.
+ *
+ * Heavy — the whole product list is downloaded, parsed and written back — so
+ * it runs on its own, after the stock check and its heartbeat are safe.
  */
-async function fetchViaCatalog(env, substore, skus, sessions, summary) {
-  const session = await openSession(substore)
-  sessions.set(substore, session)
-  await db.putMeta(env, 'store_version', session.version)
-
-  const all = await session.products()
-  await db.putCatalog(env, substore, all)
-  summary.catalog = true
-
-  const wanted = new Set(skus)
-  return all.filter((p) => wanted.has(p.sku))
-}
-
-async function fetchWatched(substore, skus, sessions, storeVersion) {
-  let session = sessions.get(substore)
-  if (!session) {
-    session = await openSession(substore, { storeVersion })
-    sessions.set(substore, session)
+export async function refreshCatalogs(env, state, sessions = new Map()) {
+  const summary = { catalog: false, errors: [] }
+  for (const substore of state.watched.keys()) {
+    try {
+      const all = await withSession(env, state, substore, sessions, (session) => session.products())
+      await db.putCatalog(env, substore, all)
+      summary.catalog = true
+    } catch (err) {
+      summary.errors.push(`${substore} catalogue: ${err.message}`)
+    }
   }
-  return session.products({ skus })
+  if (summary.catalog) await db.putMeta(env, 'last_catalog_ok', 1)
+  return summary
 }
 
 /** One message per user, however many of their items came back together. */
@@ -165,10 +231,12 @@ export async function runSweeps(env) {
 
   // Read before this run overwrites it: the previous success is what tells us
   // whether the firings in between died.
-  const lastOk = await db.getMetaRow(env, 'last_sweep_ok')
-  const catalogRow = await db.getMetaRow(env, 'last_catalog_ok')
+  const state = await db.loadState(env)
+  const lastOk = state.meta.get('last_sweep_ok')
+  const catalogRow = state.meta.get('last_catalog_ok')
   const catalogDue = !catalogRow || startedAt - catalogRow.updated_at > CATALOG_EVERY_MS
 
+  const failed = []
   for (let i = 0; i < sweeps; i++) {
     if (i > 0) {
       await sleep(spacing)
@@ -176,28 +244,56 @@ export async function runSweeps(env) {
       if (Date.now() - startedAt > WINDOW_MS) break
     }
 
-    const result = await runCheck(env, sessions, { refreshCatalog: i === 0 && catalogDue })
-    if (result.catalog) {
-      totals.catalog = true
-      await db.putMeta(env, 'last_catalog_ok', 1)
-    }
+    const result = await runCheck(env, state, sessions)
     totals.sweeps++
     totals.substores = result.substores
     totals.alerts += result.alerts
     totals.changes += result.changes
     totals.errors.push(...result.errors)
+    failed.push(...result.failed)
   }
 
   totals.elapsedMs = Date.now() - startedAt
 
-  // Heartbeat. A killed invocation never reaches this line, so a stale
-  // timestamp is direct evidence that sweeps are dying.
-  await db.putMeta(env, 'last_sweep_ok', totals.elapsedMs)
+  // A check that got no stock data is not a healthy firing, however cleanly
+  // the worker itself ran. Count them, and tell the admin when it keeps
+  // happening; the heartbeat below only proves the firing was not killed.
+  const previousHealth = parseHealth(state.meta.get('check_health'))
+  const health = nextHealth(previousHealth, failed, startedAt)
+  if (failed.length) totals.failedChecks = health.state.failures
 
   const gap = sweepGap(lastOk ? lastOk.updated_at : null, startedAt)
-  if (gap) {
-    totals.gap = gap
-    await reportGap(env, gap)
+  if (gap) totals.gap = gap
+
+  // Telling the admin is the one step that talks to Telegram for a reason
+  // other than a restock, so a failure there must not stop the heartbeat.
+  const tell = async (message, notify) => {
+    try {
+      await notify()
+    } catch (err) {
+      totals.errors.push(`${message}: ${err.message}`)
+      return false
+    }
+    return true
+  }
+  if (gap) await tell('gap report', () => reportGap(env, gap))
+  if (health.notify) {
+    const sent = await tell('health report', () => reportHealth(env, health.notify, previousHealth, health.state, startedAt))
+    // Unsent means unannounced: leave the alert due so the next firing retries.
+    if (!sent) health.state.alertedAt = previousHealth.alertedAt
+  }
+
+  // Heartbeat. A killed invocation never reaches this line, so a stale
+  // timestamp is direct evidence that sweeps are dying.
+  const writes = [['last_sweep_ok', totals.elapsedMs]]
+  if (health.changed) writes.push(['check_health', JSON.stringify(health.state)])
+  await db.putMetas(env, writes)
+
+  // Last, and on its own: the heaviest thing a firing does.
+  if (catalogDue) {
+    const refreshed = await refreshCatalogs(env, state, sessions)
+    totals.catalog = refreshed.catalog
+    totals.errors.push(...refreshed.errors)
   }
 
   return totals

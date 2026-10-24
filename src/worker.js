@@ -5,7 +5,7 @@
 import * as db from './db.js'
 import { handleUpdate, COMMANDS } from './bot/index.js'
 import { setCommands } from './telegram.js'
-import { runCheck, runSweeps } from './sweep.js'
+import { runCheck, refreshCatalogs, runSweeps } from './sweep.js'
 
 export default {
   async fetch(request, env, ctx) {
@@ -54,13 +54,11 @@ export default {
 
     // Manual sweep, handy for testing without waiting for cron.
     if (url.pathname === '/check' && url.searchParams.get('key') === env.SETUP_KEY) {
-      return Response.json(await runCheck(env))
+      return Response.json(await runCheck(env, await db.loadState(env)))
     }
 
     if (url.pathname === '/catalog' && url.searchParams.get('key') === env.SETUP_KEY) {
-      const result = await runCheck(env, new Map(), { refreshCatalog: true })
-      if (result.catalog) await db.putMeta(env, 'last_catalog_ok', 1)
-      return Response.json(result)
+      return Response.json(await refreshCatalogs(env, await db.loadState(env)))
     }
 
     if (url.pathname === '/webhook' && request.method === 'POST') {
@@ -81,10 +79,17 @@ export default {
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
-      runSweeps(env).then((s) => {
-        if (s.errors.length) console.error('sweep errors:', s.errors)
-        console.log(`${s.sweeps} sweeps, ${s.alerts} alerts${s.catalog ? ', catalog refreshed' : ''}`)
-      })
+      runSweeps(env).then(
+        (s) => {
+          if (s.errors.length) console.error('sweep errors:', s.errors)
+          console.log(`${s.sweeps} sweeps, ${s.alerts} alerts${s.catalog ? ', catalog refreshed' : ''}`)
+        },
+        (err) => {
+          // Name the failure in the log, then let it fail the invocation too.
+          console.error('sweep failed:', err.message)
+          throw err
+        }
+      )
     )
   }
 }

@@ -22,7 +22,8 @@ function d1(sqlite) {
   })
   return {
     prepare: (sql) => statement(sql),
-    batch: async (statements) => statements.map((s) => s.run())
+    // Like D1, a batch answers with one { results } per statement, reads included.
+    batch: async (statements) => statements.map((s) => s.all())
   }
 }
 

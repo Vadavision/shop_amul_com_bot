@@ -19,6 +19,12 @@ const PRODUCT_FIELDS = [
   'inventory_allow_out_of_stock'
 ]
 
+const slim = (p) => {
+  const out = {}
+  for (const field of PRODUCT_FIELDS) if (field in p) out[field] = p[field]
+  return out
+}
+
 const BASE_HEADERS = {
   accept: 'application/json, text/plain, */*',
   'accept-language': 'en-US,en;q=0.9,hi;q=0.8',
@@ -136,6 +142,30 @@ export class AmulSession {
     return this.storeVersion
   }
 
+  /**
+   * Everything needed to carry on from another invocation. Opening a session
+   * costs two requests (cookies, then binding the substore), which on a
+   * minute-by-minute cron was most of the work in a check.
+   */
+  export() {
+    return {
+      jar: [...this.jar],
+      tid: this.tid,
+      storeVersion: this.storeVersion,
+      substore: this.substore,
+      at: Date.now()
+    }
+  }
+
+  static restore(data) {
+    const session = new AmulSession()
+    session.jar = new Map(data.jar)
+    session.tid = data.tid
+    session.storeVersion = data.storeVersion
+    session.substore = data.substore
+    return session
+  }
+
   async #loadStoreVersion() {
     try {
       const res = await this.#request(
@@ -235,7 +265,9 @@ export class AmulSession {
         throw new AmulError('Product response had no data array', 'BAD_SHAPE')
       }
 
-      collected.push(...json.data)
+      // The API sends ~20 fields per product whatever is asked for. Keeping
+      // only the ones used halves what the catalogue cache stores and parses.
+      for (const p of json.data) collected.push(slim(p))
       const total = json.paging?.total ?? collected.length
       if (!json.data.length || collected.length >= total) break
       start += json.data.length

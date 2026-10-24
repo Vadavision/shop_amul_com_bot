@@ -13,8 +13,11 @@ crons = ["* * * * *"]
 # allowlist = admin plus anyone added with /allow   <- start here
 # public    = anyone who finds the bot
 # Sweeps performed inside each firing. The Workers free plan caps CPU at 10ms
-# per invocation: one sweep measures ~8.8ms median, three measured ~25ms and
-# got a quarter of all firings killed. Leave this at 1 unless on Workers Paid.
+# per invocation, and almost all of it is spent awaiting I/O. A check is one
+# batched D1 read, one Amul request on a saved session and one batched write;
+# the catalogue refresh runs after the heartbeat. Before that a sweep measured
+# ~9ms median and three sweeps got a quarter of all firings killed. Leave this
+# at 1 unless on Workers Paid.
 SWEEPS_PER_RUN = "1"
 
 ACCESS_MODE = "allowlist"

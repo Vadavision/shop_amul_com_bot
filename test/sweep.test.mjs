@@ -10,7 +10,9 @@ import { test, before } from 'node:test'
 import assert from 'node:assert/strict'
 import { createEnv, telegram, sentTo } from './support.mjs'
 import { openSession, isInStock } from '../src/amul.js'
-import { runSweeps } from '../src/sweep.js'
+import { runSweeps, runCheck } from '../src/sweep.js'
+import { nextHealth, FRESH_HEALTH } from '../src/health.js'
+import * as db from '../src/db.js'
 import { handleUpdate } from '../src/bot/index.js'
 
 const USER = 1000001
@@ -111,4 +113,78 @@ test('a catalogue refresh is logged the same way', async () => {
 test('missing SWEEPS_PER_RUN fails loudly instead of defaulting', async () => {
   const { env: unset } = createEnv({})
   await assert.rejects(runSweeps(unset), /SWEEPS_PER_RUN must be an integer/)
+})
+
+test('a check reuses the saved Amul session instead of opening a new one', async () => {
+  const saved = sqlite.prepare("SELECT value FROM meta WHERE key = 'amul_session:punjab'").get()
+  assert.ok(saved, 'the first sweep saved its session')
+
+  const amulCalls = []
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes('shop.amul.com')) amulCalls.push(new URL(url).pathname)
+    return realFetch(url, options)
+  }
+  try {
+    const state = await db.loadState(env)
+    await runCheck(env, state)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+  assert.deepEqual(amulCalls, ['/api/1/entity/ms.products'], 'one request: no info.js, no setPreferences')
+})
+
+test('a saved session that stopped working is replaced, not reported as a failure', async () => {
+  sqlite
+    .prepare("UPDATE meta SET value = json_set(value, '$.tid', 'stale') WHERE key = 'amul_session:punjab'")
+    .run()
+  const run = await runCheck(env, await db.loadState(env))
+  assert.deepEqual(run.failed, [])
+  assert.ok(run.checked > 0, 'still got stock')
+})
+
+test('repeated Amul failures alert the admin once, then announce recovery', async () => {
+  const { env: down, sqlite: dbDown } = createEnv({ SWEEPS_PER_RUN: '1', ADMIN_CHAT_ID: String(ADMIN) })
+  const now = Date.now()
+  dbDown.prepare(`INSERT INTO users (chat_id, first_name, pincode, substore, created_at, updated_at) VALUES (?, 'T', '143505', 'punjab', ?, ?)`).run(USER, now, now)
+  dbDown.prepare('INSERT INTO tracks (chat_id, sku, name, created_at) VALUES (?, ?, ?, ?)').run(USER, 'WPCCP02_01', 'whey', now)
+  dbDown.prepare("INSERT INTO meta (key, value, updated_at) VALUES ('last_catalog_ok', '1', ?)").run(now)
+
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async (url, options) =>
+    String(url).includes('shop.amul.com') ? new Response('bad gateway', { status: 504 }) : realFetch(url, options)
+  try {
+    telegram.length = 0
+    for (let i = 1; i <= 4; i++) {
+      const run = await runSweeps(down)
+      assert.equal(run.failedChecks, i)
+      assert.match(run.errors[0], /punjab: .*504/, 'the cause is reported')
+    }
+    assert.equal(sentTo(ADMIN).length, 0, 'four failures in a row is still just noise')
+
+    await runSweeps(down)
+    assert.equal(sentTo(ADMIN).length, 1, 'the fifth raises the alarm')
+    assert.match(sentTo(ADMIN)[0].body.text, /Stock checks are failing/)
+    assert.match(sentTo(ADMIN)[0].body.text, /504/)
+
+    await runSweeps(down)
+    assert.equal(sentTo(ADMIN).length, 1, 'and does not repeat every minute')
+  } finally {
+    globalThis.fetch = realFetch
+  }
+
+  const run = await runSweeps(down)
+  assert.deepEqual(run.errors, [], 'Amul is back')
+  assert.equal(sentTo(ADMIN).length, 2)
+  assert.match(sentTo(ADMIN)[1].body.text, /recovered/)
+  assert.equal(JSON.parse(dbDown.prepare("SELECT value FROM meta WHERE key = 'check_health'").get().value).failures, 0)
+})
+
+test('health streak: a lone failure is silent and a clean run resets it', () => {
+  const now = Date.now()
+  const one = nextHealth(FRESH_HEALTH, [{ substore: 'punjab', error: 'HTTP 504' }], now)
+  assert.equal(one.notify, null)
+  const clear = nextHealth(one.state, [], now + 60000)
+  assert.equal(clear.notify, null, 'no alert was sent, so no recovery either')
+  assert.equal(clear.state.failures, 0)
 })

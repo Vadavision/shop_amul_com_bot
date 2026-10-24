@@ -43,3 +43,78 @@ export async function reportGap(env, gap) {
     ].join('\n')
   )
 }
+
+// A single 504 from Amul is routine and the next minute fixes it. Five
+// failing firings in a row is a real outage, and the point at which a restock
+// could be going unseen.
+const FAILURES_BEFORE_ALERT = 5
+
+// While an outage drags on, say so again now and then rather than once.
+const REMIND_EVERY_MS = 6 * 60 * 60 * 1000
+
+export const FRESH_HEALTH = { failures: 0, since: 0, lastError: '', alertedAt: 0 }
+
+/** The stored streak, tolerating a missing or damaged row. */
+export function parseHealth(row) {
+  try {
+    return { ...FRESH_HEALTH, ...JSON.parse(row?.value) }
+  } catch {
+    return { ...FRESH_HEALTH }
+  }
+}
+
+/**
+ * Fold one firing into the failure streak.
+ *
+ * `failed` is the list of substores whose check produced no stock data. A
+ * firing that threw those errors away while still writing its heartbeat is how
+ * a dead Amul connection used to look healthy for days.
+ *
+ * Returns the new state, whether it needs saving, and what (if anything) the
+ * admin should hear: 'failing' once the streak is long enough, 'recovered'
+ * when it ends after an alert was sent.
+ */
+export function nextHealth(previous, failed, now) {
+  if (!failed.length) {
+    if (!previous.failures) return { state: previous, changed: false, notify: null }
+    return {
+      state: { ...FRESH_HEALTH },
+      changed: true,
+      notify: previous.alertedAt ? 'recovered' : null
+    }
+  }
+
+  const state = {
+    failures: previous.failures + 1,
+    since: previous.failures ? previous.since : now,
+    lastError: failed.map((f) => `${f.substore}: ${f.error}`).join('; ').slice(0, 300),
+    alertedAt: previous.alertedAt
+  }
+  const due = state.failures >= FAILURES_BEFORE_ALERT && now - previous.alertedAt >= REMIND_EVERY_MS
+  if (due) state.alertedAt = now
+  return { state, changed: true, notify: due ? 'failing' : null }
+}
+
+export async function reportHealth(env, kind, previous, state, now) {
+  if (!env.ADMIN_CHAT_ID) {
+    console.error(`stock checks ${kind} and no ADMIN_CHAT_ID is set to tell`)
+    return
+  }
+  const lines =
+    kind === 'failing'
+      ? [
+          '🚨 <b>Stock checks are failing</b>',
+          '',
+          `${state.failures} checks in a row have failed, since ${esc(formatIst(state.since))}.`,
+          `Last error: <code>${esc(state.lastError)}</code>`,
+          '',
+          'Restocks are not being detected until this clears. You will hear when it does.'
+        ]
+      : [
+          '✅ <b>Stock checks recovered</b>',
+          '',
+          `They were failing from ${esc(formatIst(previous.since))} to ${esc(formatIst(now))} (${esc(formatDuration(now - previous.since))}).`,
+          'A restock during that time may have been missed.'
+        ]
+  await send(env, env.ADMIN_CHAT_ID, lines.join('\n'))
+}

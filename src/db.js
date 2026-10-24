@@ -74,16 +74,6 @@ export async function removeTrack(env, chatId, sku) {
     .run()
 }
 
-/** Substores that at least one active user is actually watching. */
-export async function activeSubstores(env) {
-  const { results } = await env.DB.prepare(
-    `SELECT DISTINCT u.substore FROM users u
-     JOIN tracks t ON t.chat_id = u.chat_id
-     WHERE u.substore IS NOT NULL AND u.is_blocked = 0 AND u.is_paused = 0`
-  ).all()
-  return (results ?? []).map((r) => r.substore)
-}
-
 /** Everyone tracking any of `skus` within one substore. */
 export async function watchersFor(env, substore, skus) {
   if (!skus.length) return []
@@ -218,16 +208,36 @@ export async function putCatalog(env, substore, products) {
     .run()
 }
 
-/** Distinct SKUs that active users in this substore are watching. */
-export async function trackedSkus(env, substore) {
-  const { results } = await env.DB.prepare(
-    `SELECT DISTINCT t.sku FROM tracks t
-     JOIN users u ON u.chat_id = t.chat_id
-     WHERE u.substore = ? AND u.is_blocked = 0 AND u.is_paused = 0`
-  )
-    .bind(substore)
-    .all()
-  return (results ?? []).map((r) => r.sku)
+/**
+ * Everything a check needs to read, in one round trip.
+ *
+ * On the free plan every awaited call costs CPU, and a check used to make
+ * seven of them before it had looked at Amul. All three reads are batched
+ * here: the meta rows (heartbeat, store version, cached sessions), what each
+ * active substore is watching, and the remembered stock of each substore.
+ */
+export async function loadState(env) {
+  const [metaRows, watchedRows, snapshotRows] = await env.DB.batch([
+    env.DB.prepare('SELECT key, value, updated_at FROM meta'),
+    env.DB.prepare(
+      `SELECT DISTINCT u.substore, t.sku FROM users u
+       JOIN tracks t ON t.chat_id = u.chat_id
+       WHERE u.substore IS NOT NULL AND u.is_blocked = 0 AND u.is_paused = 0`
+    ),
+    env.DB.prepare('SELECT substore, data FROM snapshots')
+  ])
+
+  const meta = new Map((metaRows.results ?? []).map((r) => [r.key, r]))
+
+  // Substores that at least one active user is watching, with the SKUs wanted.
+  const watched = new Map()
+  for (const { substore, sku } of watchedRows.results ?? []) {
+    if (!watched.has(substore)) watched.set(substore, [])
+    watched.get(substore).push(sku)
+  }
+
+  const snapshots = new Map((snapshotRows.results ?? []).map((r) => [r.substore, r.data]))
+  return { meta, watched, snapshots }
 }
 
 /** Age of the cached catalogue, or Infinity when there is none. */
@@ -256,6 +266,17 @@ export async function putMeta(env, key, value) {
   )
     .bind(key, String(value), Date.now())
     .run()
+}
+
+/** Several meta rows in one round trip. `entries` is [[key, value], ...]. */
+export async function putMetas(env, entries) {
+  if (!entries.length) return
+  const now = Date.now()
+  const upsert = env.DB.prepare(
+    `INSERT INTO meta (key, value, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+  )
+  await env.DB.batch(entries.map(([key, value]) => upsert.bind(key, String(value), now)))
 }
 
 /**

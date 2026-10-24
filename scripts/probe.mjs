@@ -1,5 +1,5 @@
 /** Verifies the Amul layer end-to-end without Cloudflare. Usage: node scripts/probe.mjs 380015 */
-import { openSession, isInStock, inventoryQuantity, productUrl, CATEGORIES } from '../src/amul.js'
+import { openSession, isInStock, inventoryQuantity, productUrl } from '../src/amul.js'
 
 const pincode = process.argv[2] ?? '380015'
 const wanted = (process.argv[3] ?? 'protein').split(',')
