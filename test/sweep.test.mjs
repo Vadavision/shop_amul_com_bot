@@ -188,3 +188,106 @@ test('health streak: a lone failure is silent and a clean run resets it', () => 
   assert.equal(clear.notify, null, 'no alert was sent, so no recovery either')
   assert.equal(clear.state.failures, 0)
 })
+
+// --- auto cart --------------------------------------------------------------
+// Stock is live Amul; only the cart endpoint is faked, so a test run does not
+// leave real guest carts behind on shop.amul.com.
+
+function fakeCarts(handler) {
+  const calls = []
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes('/entity/ms.carts/')) {
+      calls.push({ url: String(url), body: JSON.parse(options.body) })
+      return handler(calls)
+    }
+    return realFetch(url, options)
+  }
+  return { calls, restore: () => { globalThis.fetch = realFetch } }
+}
+
+async function cartScenario() {
+  const { env: cartEnv, sqlite: db2 } = createEnv({ SWEEPS_PER_RUN: '1', ADMIN_CHAT_ID: String(ADMIN), AUTO_CART: '1' })
+  const now = Date.now()
+  db2.prepare(`INSERT INTO users (chat_id, first_name, pincode, substore, created_at, updated_at) VALUES (?, 'T', '143505', ?, ?, ?)`).run(USER, SUBSTORE, now, now)
+  db2.prepare('INSERT INTO tracks (chat_id, sku, name, created_at) VALUES (?, ?, ?, ?)').run(USER, inStock.sku, inStock.name, now)
+  // Remembered as sold out, so this sweep sees a restock.
+  db2.prepare('INSERT INTO snapshots (substore, data, updated_at) VALUES (?, ?, ?)').run(SUBSTORE, JSON.stringify({ [inStock.sku]: 0 }), now)
+  db2.prepare("INSERT INTO meta (key, value, updated_at) VALUES ('last_catalog_ok', '1', ?)").run(now)
+  telegram.length = 0
+  return { cartEnv, db2 }
+}
+
+const cartResponse = (id) => Response.json({ cart: { _id: id, items: [{ sku: inStock.sku, quantity: 1 }] } })
+
+test('a restock alert gets an Open cart & checkout button once the cart is built', async () => {
+  const { cartEnv, db2 } = await cartScenario()
+  const carts = fakeCarts(() => cartResponse('cart123'))
+  try {
+    const run = await runSweeps(cartEnv)
+    assert.equal(run.alerts, 1)
+    assert.equal(run.carts, 1)
+    assert.deepEqual(run.errors, [])
+  } finally {
+    carts.restore()
+  }
+
+  assert.equal(carts.calls.length, 1, 'one product, one add')
+  assert.match(carts.calls[0].url, /\/entity\/ms\.carts\/_\/addItem$/, 'the first add starts a cart')
+  assert.equal(carts.calls[0].body.data.sku, inStock.sku)
+  assert.ok(carts.calls[0].body.data.product_id, 'the cart needs the product id, not just the sku')
+
+  assert.equal(sentTo(USER).length, 1, 'still just the one alert message')
+  const edit = telegram.find((c) => c.method === 'editMessageReplyMarkup')
+  assert.equal(edit.body.chat_id, USER)
+  assert.equal(edit.body.message_id, 555, 'the button is added to the alert that was sent')
+  const [first] = edit.body.reply_markup.inline_keyboard
+  assert.equal(first[0].url, 'https://shop.amul.com/en/cart/cart123/processing')
+  assert.ok(edit.body.reply_markup.inline_keyboard.length > 1, 'the buy-now links are still there')
+  assert.equal(db2.prepare("SELECT value FROM meta WHERE key = 'cart_jobs'").get().value, '[]', 'job cleared')
+})
+
+test('a cart that cannot be built is retried, and the alert is never held up for it', async () => {
+  const { cartEnv, db2 } = await cartScenario()
+  const carts = fakeCarts(() => new Response('bad gateway', { status: 502 }))
+  try {
+    const run = await runSweeps(cartEnv)
+    assert.equal(run.alerts, 1, 'the alert went out regardless')
+    assert.match(run.errors.join(), /cart for .*502/)
+    assert.equal(run.carts, 0)
+  } finally {
+    carts.restore()
+  }
+  assert.equal(sentTo(USER).length, 1)
+  assert.equal(telegram.filter((c) => c.method === 'editMessageReplyMarkup').length, 0)
+  const jobs = JSON.parse(db2.prepare("SELECT value FROM meta WHERE key = 'cart_jobs'").get().value)
+  assert.equal(jobs.length, 1, 'waiting for the next firing')
+  assert.equal(jobs[0].tries, 1)
+  assert.ok(db2.prepare("SELECT 1 FROM meta WHERE key = 'last_sweep_ok'").get(), 'heartbeat written')
+
+  // Next minute Amul is fine again.
+  const again = fakeCarts(() => cartResponse('cart456'))
+  try {
+    const run = await runSweeps(cartEnv)
+    assert.equal(run.carts, 1)
+  } finally {
+    again.restore()
+  }
+  assert.match(telegram.find((c) => c.method === 'editMessageReplyMarkup').body.reply_markup.inline_keyboard[0][0].url, /cart456/)
+  assert.equal(db2.prepare("SELECT value FROM meta WHERE key = 'cart_jobs'").get().value, '[]')
+})
+
+test('with AUTO_CART off nothing touches a cart', async () => {
+  const { cartEnv } = await cartScenario()
+  cartEnv.AUTO_CART = '0'
+  const carts = fakeCarts(() => cartResponse('never'))
+  try {
+    const run = await runSweeps(cartEnv)
+    assert.equal(run.alerts, 1)
+    assert.equal(run.carts, 0)
+  } finally {
+    carts.restore()
+  }
+  assert.equal(carts.calls.length, 0)
+  assert.equal(telegram.filter((c) => c.method === 'editMessageReplyMarkup').length, 0)
+})

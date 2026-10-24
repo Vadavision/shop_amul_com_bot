@@ -20,6 +20,10 @@ crons = ["* * * * *"]
 # at 1 unless on Workers Paid.
 SWEEPS_PER_RUN = "1"
 
+# 1 = when an alert goes out, also put the restocked items in a guest cart and
+# add an "Open cart & checkout" button to it. No Amul login is involved.
+AUTO_CART = "1"
+
 ACCESS_MODE = "allowlist"
 
 # ADMIN_CHAT_ID is a secret, not a var, so it stays out of the repo:

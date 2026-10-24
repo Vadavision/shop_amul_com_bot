@@ -13,7 +13,7 @@
  */
 import { AmulSession, openSession, isInStock } from './amul.js'
 import * as db from './db.js'
-import { send, isUnreachable } from './telegram.js'
+import { send, editButtons, isUnreachable } from './telegram.js'
 import { restockMessage, buyButtons } from './alert.js'
 import { sweepGap, reportGap, parseHealth, nextHealth, reportHealth } from './health.js'
 
@@ -45,6 +45,13 @@ const STORE_VERSION_TTL_MS = 6 * 60 * 60 * 1000
 const WINDOW_MS = 45000
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// An alert is sent the moment a restock is seen; the cart behind its checkout
+// button is built a beat later. A job that cannot be finished is retried each
+// minute for a few minutes, then dropped: a cart that late is not worth much.
+const CART_JOB_TRIES = 3
+const CART_JOB_MAX_AGE_MS = 10 * 60 * 1000
+const CART_JOBS_PER_RUN = 2
 
 const sessionKey = (substore) => `amul_session:${substore}`
 
@@ -112,7 +119,7 @@ const parseSnapshot = (text) => {
  * passes in the same firing need no more reads.
  */
 export async function runCheck(env, state, sessions = new Map()) {
-  const summary = { substores: state.watched.size, checked: 0, alerts: 0, changes: 0, catalog: false, errors: [], failed: [] }
+  const summary = { substores: state.watched.size, checked: 0, alerts: 0, changes: 0, catalog: false, errors: [], failed: [], cartJobs: [] }
 
   for (const [substore, skus] of state.watched) {
     try {
@@ -201,8 +208,18 @@ async function notifyWatchers(env, substore, restocked, summary) {
   let sent = 0
   for (const [chatId, items] of perUser) {
     try {
-      await send(env, chatId, restockMessage(items), buyButtons(items))
+      const message = await send(env, chatId, restockMessage(items), buyButtons(items))
       sent++
+      if (env.AUTO_CART === '1') {
+        summary.cartJobs.push({
+          chatId,
+          messageId: message?.message_id ?? null,
+          substore,
+          skus: items.slice(0, 5).map((p) => p.sku),
+          at: Date.now(),
+          tries: 0
+        })
+      }
     } catch (err) {
       if (isUnreachable(err)) {
         // Mark, never delete. The upstream bot deletes the user and every
@@ -214,6 +231,69 @@ async function notifyWatchers(env, substore, restocked, summary) {
     }
   }
   return sent
+}
+
+const parseJobs = (row) => {
+  try {
+    const jobs = JSON.parse(row?.value)
+    return Array.isArray(jobs) ? jobs : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Put what just came back in stock into a guest cart, and give the alert a
+ * button that opens it.
+ *
+ * Amul carts are records addressed by id, so the cart the bot builds here can
+ * be opened from any browser (see cartUrl). Nothing is paid for and no account
+ * is involved; the owner signs in at checkout like any other order.
+ */
+async function buildCart(env, state, sessions, job) {
+  const { cartId, items } = await withSession(env, state, job.substore, sessions, async (session) => {
+    const items = (await session.products({ skus: job.skus, raw: true })).filter(isInStock)
+    let id = null
+    for (const product of items) id = (await session.addToCart(product, { cartId: id })).cart._id
+    return { cartId: id, items }
+  })
+  // Gone again before the cart could be built: the alert still has its buy links.
+  if (!cartId) return false
+
+  const buttons = buyButtons(items, cartId)
+  if (job.messageId) {
+    try {
+      await editButtons(env, job.chatId, job.messageId, buttons)
+      return true
+    } catch {
+      // The message was deleted or is too old to edit; fall through to a new one.
+    }
+  }
+  await send(env, job.chatId, '🛒 <b>Your cart is ready</b>\n\nTap to review it and check out.', buttons)
+  return true
+}
+
+/** Work through waiting cart jobs, returning the ones still to retry. */
+async function runCartJobs(env, state, sessions, jobs, totals) {
+  const now = Date.now()
+  const keep = []
+  let done = 0
+  for (const job of jobs) {
+    if (now - job.at > CART_JOB_MAX_AGE_MS || job.tries >= CART_JOB_TRIES) continue
+    if (done >= CART_JOBS_PER_RUN) {
+      keep.push(job)
+      continue
+    }
+    done++
+    try {
+      await buildCart(env, state, sessions, job)
+      totals.carts++
+    } catch (err) {
+      totals.errors.push(`cart for ${job.chatId}: ${err.message}`)
+      keep.push({ ...job, tries: job.tries + 1 })
+    }
+  }
+  return keep
 }
 
 /**
@@ -232,7 +312,7 @@ export async function runSweeps(env) {
   const startedAt = Date.now()
   const spacing = Math.floor(WINDOW_MS / sweeps)
   const sessions = new Map()
-  const totals = { sweeps: 0, substores: 0, alerts: 0, changes: 0, catalog: false, errors: [] }
+  const totals = { sweeps: 0, substores: 0, alerts: 0, changes: 0, carts: 0, catalog: false, errors: [] }
 
   // Read before this run overwrites it: the previous success is what tells us
   // whether the firings in between died.
@@ -242,6 +322,7 @@ export async function runSweeps(env) {
   const catalogDue = !catalogRow || startedAt - catalogRow.updated_at > CATALOG_EVERY_MS
 
   const failed = []
+  const newJobs = []
   for (let i = 0; i < sweeps; i++) {
     if (i > 0) {
       await sleep(spacing)
@@ -256,6 +337,7 @@ export async function runSweeps(env) {
     totals.changes += result.changes
     totals.errors.push(...result.errors)
     failed.push(...result.failed)
+    newJobs.push(...result.cartJobs)
   }
 
   totals.elapsedMs = Date.now() - startedAt
@@ -292,7 +374,20 @@ export async function runSweeps(env) {
   // timestamp is direct evidence that sweeps are dying.
   const writes = [['last_sweep_ok', totals.elapsedMs]]
   if (health.changed) writes.push(['check_health', JSON.stringify(health.state)])
+  const waiting = [...parseJobs(state.meta.get('cart_jobs')), ...newJobs]
+  // Saved with the heartbeat, so a firing killed before the cart is built still
+  // leaves the job for the next one.
+  if (newJobs.length) writes.push(['cart_jobs', JSON.stringify(waiting)])
   await db.putMetas(env, writes)
+
+  // Straight after the heartbeat: the alert is already out, and a cart that is
+  // ready within a few seconds is worth more than a fresh catalogue.
+  if (waiting.length) {
+    const remaining = await runCartJobs(env, state, sessions, waiting, totals)
+    if (JSON.stringify(remaining) !== JSON.stringify(waiting)) {
+      await db.putMeta(env, 'cart_jobs', JSON.stringify(remaining))
+    }
+  }
 
   // Last, and on its own: the heaviest thing a firing does.
   if (catalogDue) {

@@ -53,6 +53,13 @@ export const edit = (env, chatId, messageId, text, extra = {}) =>
     ...extra
   })
 
+export const editButtons = (env, chatId, messageId, markup) =>
+  call(env, 'editMessageReplyMarkup', {
+    chat_id: chatId,
+    message_id: messageId,
+    reply_markup: markup.reply_markup
+  })
+
 export const answerCallback = (env, id, text = '', alert = false) =>
   call(env, 'answerCallbackQuery', {
     callback_query_id: id,

@@ -5,7 +5,7 @@
  * cron sweep render through exactly the same code. A test alert that merely
  * resembled the real one would be worth very little.
  */
-import { inventoryQuantity, productUrl } from './amul.js'
+import { inventoryQuantity, productUrl, cartUrl } from './amul.js'
 import { esc, keyboard } from './telegram.js'
 
 export function restockMessage(items, { test = false } = {}) {
@@ -36,13 +36,15 @@ export function restockMessage(items, { test = false } = {}) {
   return lines.join('\n')
 }
 
-export function buyButtons(items) {
-  return keyboard(
-    items.slice(0, 5).map((p) => [
+export function buyButtons(items, cartId = null) {
+  const cart = cartId ? [[{ text: '✅ Open cart & checkout', url: cartUrl(cartId) }]] : []
+  return keyboard([
+    ...cart,
+    ...items.slice(0, 5).map((p) => [
       {
         text: `🛒 ${p.name.length > 32 ? `${p.name.slice(0, 31)}…` : p.name}`,
         url: productUrl(p)
       }
     ])
-  )
+  ])
 }

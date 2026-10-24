@@ -221,7 +221,7 @@ export class AmulSession {
    */
   async products(options = {}) {
     // Back-compat: an array argument used to mean category ids.
-    const { categories = null, skus = null } = Array.isArray(options)
+    const { categories = null, skus = null, raw = false } = Array.isArray(options)
       ? { categories: options }
       : options
 
@@ -267,13 +267,42 @@ export class AmulSession {
 
       // The API sends ~20 fields per product whatever is asked for. Keeping
       // only the ones used halves what the catalogue cache stores and parses.
-      for (const p of json.data) collected.push(slim(p))
+      for (const p of json.data) collected.push(raw ? p : slim(p))
       const total = json.paging?.total ?? collected.length
       if (!json.data.length || collected.length >= total) break
       start += json.data.length
     }
 
     return collected
+  }
+
+  /**
+   * Put a product in this session's cart and return the cart.
+   *
+   * `product` must be unslimmed (products({ raw: true })): the cart wants the
+   * product's `_id` and `seller`, which the stock check never needs. With no
+   * `cartId` Amul starts a cart; pass the id back to add to an existing one.
+   * Only ever adds — nothing here pays for anything.
+   */
+  async addToCart(product, { quantity = 1, cartId = null } = {}) {
+    const path = cartId ? `${cartId}/_/addItem` : '_/addItem'
+    const res = await this.#request(`${SHOP}/entity/ms.carts/${path}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', tid: await this.#tidHeader() },
+      body: {
+        data: {
+          product_id: product._id,
+          seller_id: product.seller,
+          selected_options: {},
+          selected_addons: {},
+          variant_id: null,
+          quantity,
+          linked_product_id: product.linked_product_id ?? null,
+          sku: product.sku
+        }
+      }
+    })
+    return res.json()
   }
 
   /**
@@ -320,6 +349,18 @@ export function isInStock(p) {
   if (p.available <= 0) return false
   if (inventoryQuantity(p) <= 0) return false
   return p.inventory_quantity >= p.inventory_low_stock_quantity
+}
+
+/**
+ * A link that puts a cart in front of whoever opens it.
+ *
+ * Amul carts are plain records addressed by id, so a cart the bot built as a
+ * guest can be picked up by any browser: this page merges the cart named in the
+ * URL into the visitor's own, then lands on their cart. They sign in at
+ * checkout, as they would for any order. No login or cookie of yours is held.
+ */
+export function cartUrl(cartId) {
+  return `${SHOP}/en/cart/${cartId}/processing`
 }
 
 export function productUrl(p) {

@@ -82,7 +82,7 @@ export default {
       runSweeps(env).then(
         (s) => {
           if (s.errors.length) console.error('sweep errors:', s.errors)
-          console.log(`${s.sweeps} sweeps, ${s.alerts} alerts${s.catalog ? ', catalog refreshed' : ''}`)
+          console.log(`${s.sweeps} sweeps, ${s.alerts} alerts${s.carts ? `, ${s.carts} carts` : ''}${s.catalog ? ', catalog refreshed' : ''}`)
         },
         (err) => {
           // Name the failure in the log, then let it fail the invocation too.
