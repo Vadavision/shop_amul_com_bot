@@ -15,7 +15,7 @@ import { AmulSession, openSession, isInStock } from './amul.js'
 import * as db from './db.js'
 import { send, editButtons, isUnreachable } from './telegram.js'
 import { restockMessage, buyButtons } from './alert.js'
-import { activeLogin, addToAccountCart, reportExpired, keepLoginAlive, LoginExpiredError } from './cart.js'
+import { addToAccountCart, reportExpired, keepLoginAlive, LoginExpiredError, CartSkipError } from './cart.js'
 import { sweepGap, reportGap, parseHealth, nextHealth, reportHealth } from './health.js'
 
 /**
@@ -157,7 +157,7 @@ export async function runCheck(env, state, sessions = new Map()) {
       // Alert only on sold out -> in stock. A first sighting is logged but
       // never announced, or adding something already in stock would page you.
       const restocked = changes.filter((p) => current[p.sku] === 1 && previous[p.sku] === 0)
-      if (restocked.length) summary.alerts += await notifyWatchers(env, substore, restocked, summary, state)
+      if (restocked.length) summary.alerts += await notifyWatchers(env, substore, restocked, summary)
 
       if (changes.length) {
         const merged = { ...previous, ...current }
@@ -196,7 +196,7 @@ export async function refreshCatalogs(env, state, sessions = new Map()) {
 }
 
 /** One message per user, however many of their items came back together. */
-async function notifyWatchers(env, substore, restocked, summary, state) {
+async function notifyWatchers(env, substore, restocked, summary) {
   const bySku = new Map(restocked.map((p) => [p.sku, p]))
   const watchers = await db.watchersFor(env, substore, [...bySku.keys()])
 
@@ -206,13 +206,15 @@ async function notifyWatchers(env, substore, restocked, summary, state) {
     perUser.get(chat_id).push(bySku.get(sku))
   }
 
+  // Who has given us an Amul login to fill a cart with. Asked only on a restock.
+  const carts = env.AUTO_CART === '1' ? await db.chatsWithLogin(env, [...perUser.keys()]) : new Set()
+
   let sent = 0
   for (const [chatId, items] of perUser) {
     try {
       const message = await send(env, chatId, restockMessage(items), buyButtons(items))
       sent++
-      // Only the owner's own watches go in a cart: the cart is on their account.
-      if (env.AUTO_CART === '1' && activeLogin(state) && String(chatId) === String(env.ADMIN_CHAT_ID)) {
+      if (carts.has(String(chatId))) {
         summary.cartJobs.push({
           chatId,
           messageId: message?.message_id ?? null,
@@ -245,26 +247,28 @@ const parseJobs = (row) => {
 }
 
 /**
- * Put what just came back in stock into the owner's Amul cart, and give the
+ * Put what just came back in stock into the user's own Amul cart, and give the
  * alert a button that opens it. The cart is on their account, so it shows in
  * whichever browser they are logged in on. Nothing is paid for.
  */
 async function buildCart(env, state, job) {
-  const login = activeLogin(state)
-  if (!login) return false
-
   let items
   try {
-    items = await addToAccountCart(state, login, job)
+    items = await addToAccountCart(env, state, job)
   } catch (err) {
     if (err instanceof LoginExpiredError) {
-      await reportExpired(env, state, login)
+      await reportExpired(env, job.chatId)
+      return false
+    }
+    if (err instanceof CartSkipError) {
+      await send(env, job.chatId, `🛒 I could not add it to your cart.\n\n${err.message}`)
       return false
     }
     throw err
   }
-  // Gone again before the cart could be filled: the alert still has its buy links.
-  if (!items.length) return false
+  // No login any more, or gone again before the cart could be filled: the
+  // alert still has its buy links.
+  if (!items?.length) return false
 
   const buttons = buyButtons(items, { cart: true })
   if (job.messageId) {
@@ -394,8 +398,9 @@ export async function runSweeps(env) {
     }
   }
 
-  // Rarely does anything: a login that is used keeps itself alive, and one that
-  // has died should be found out now rather than at the next restock.
+  // At most one login per firing, and only when one is due: a login that is
+  // used keeps itself alive, and one that has died is found out now rather than
+  // at the next restock.
   try {
     await keepLoginAlive(env, state)
   } catch (err) {

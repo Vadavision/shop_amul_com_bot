@@ -208,6 +208,10 @@ export async function putCatalog(env, substore, products) {
     .run()
 }
 
+// Using an Amul login is what keeps Amul extending it, so each one is used at
+// least this often.
+export const LOGIN_KEEP_ALIVE_MS = 12 * 60 * 60 * 1000
+
 /**
  * Everything a check needs to read, in one round trip.
  *
@@ -216,15 +220,19 @@ export async function putCatalog(env, substore, products) {
  * here: the meta rows (heartbeat, store version, cached sessions), what each
  * active substore is watching, and the remembered stock of each substore.
  */
-export async function loadState(env) {
-  const [metaRows, watchedRows, snapshotRows] = await env.DB.batch([
+export async function loadState(env, now = Date.now()) {
+  const [metaRows, watchedRows, snapshotRows, dueRows] = await env.DB.batch([
     env.DB.prepare('SELECT key, value, updated_at FROM meta'),
     env.DB.prepare(
       `SELECT DISTINCT u.substore, t.sku FROM users u
        JOIN tracks t ON t.chat_id = u.chat_id
        WHERE u.substore IS NOT NULL AND u.is_blocked = 0 AND u.is_paused = 0`
     ),
-    env.DB.prepare('SELECT substore, data FROM snapshots')
+    env.DB.prepare('SELECT substore, data FROM snapshots'),
+    // At most one Amul login due its keep-alive; the ciphertext stays behind.
+    env.DB.prepare(
+      'SELECT chat_id FROM amul_logins WHERE expired = 0 AND checked_at < ? ORDER BY checked_at LIMIT 1'
+    ).bind(now - LOGIN_KEEP_ALIVE_MS)
   ])
 
   const meta = new Map((metaRows.results ?? []).map((r) => [r.key, r]))
@@ -237,7 +245,8 @@ export async function loadState(env) {
   }
 
   const snapshots = new Map((snapshotRows.results ?? []).map((r) => [r.substore, r.data]))
-  return { meta, watched, snapshots }
+  const loginDue = dueRows.results?.[0]?.chat_id ?? null
+  return { meta, watched, snapshots, loginDue }
 }
 
 /** Age of the cached catalogue, or Infinity when there is none. */
@@ -316,4 +325,43 @@ export async function listTracksWithSince(env, chatId) {
     .bind(chatId)
     .all()
   return results ?? []
+}
+
+/** One user's saved Amul login (cookie still encrypted), or null. */
+export async function getLogin(env, chatId) {
+  return env.DB.prepare('SELECT chat_id, jsessionid, saved_at, checked_at, expired FROM amul_logins WHERE chat_id = ?')
+    .bind(chatId)
+    .first()
+}
+
+/** Of these chats, the ones with a login that still works. */
+export async function chatsWithLogin(env, chatIds) {
+  if (!chatIds.length) return new Set()
+  const placeholders = chatIds.map(() => '?').join(',')
+  const { results } = await env.DB.prepare(
+    `SELECT chat_id FROM amul_logins WHERE expired = 0 AND chat_id IN (${placeholders})`
+  )
+    .bind(...chatIds)
+    .all()
+  return new Set((results ?? []).map((r) => String(r.chat_id)))
+}
+
+export async function putLogin(env, chatId, sealed, now = Date.now()) {
+  await env.DB.prepare(
+    `INSERT INTO amul_logins (chat_id, jsessionid, saved_at, checked_at, expired) VALUES (?, ?, ?, ?, 0)
+     ON CONFLICT(chat_id) DO UPDATE SET jsessionid = excluded.jsessionid, saved_at = excluded.saved_at,
+       checked_at = excluded.checked_at, expired = 0`
+  )
+    .bind(chatId, sealed, now, now)
+    .run()
+}
+
+export async function markLogin(env, chatId, { expired = false, checkedAt = Date.now() } = {}) {
+  await env.DB.prepare('UPDATE amul_logins SET expired = ?, checked_at = ? WHERE chat_id = ?')
+    .bind(expired ? 1 : 0, checkedAt, chatId)
+    .run()
+}
+
+export async function deleteLogin(env, chatId) {
+  await env.DB.prepare('DELETE FROM amul_logins WHERE chat_id = ?').bind(chatId).run()
 }

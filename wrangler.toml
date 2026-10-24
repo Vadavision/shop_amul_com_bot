@@ -20,11 +20,10 @@ crons = ["* * * * *"]
 # at 1 unless on Workers Paid.
 SWEEPS_PER_RUN = "1"
 
-# 1 = when something the owner watches comes back in stock, also add it to the
-# owner's own Amul cart and put an "Open cart & checkout" button on the alert.
-# It signs in with the owner's login cookie (send /amullogin to the bot), so it
-# does nothing until one is saved. Never pays for anything.
-AUTO_CART = "0"
+# 1 = users who opt in with /amullogin get restocked items added to their own
+# Amul cart, with an "Open cart & checkout" button on the alert. Logins are
+# stored encrypted with the LOGIN_ENC_KEY secret. Never pays for anything.
+AUTO_CART = "1"
 
 ACCESS_MODE = "allowlist"
 

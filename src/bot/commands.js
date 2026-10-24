@@ -20,6 +20,7 @@ export const COMMANDS = [
   { command: 'check', description: 'Check stock right now' },
   { command: 'history', description: 'When your items were last in stock' },
   { command: 'setpincode', description: 'Set your delivery area' },
+  { command: 'amullogin', description: 'Auto add restocks to your Amul cart' },
   { command: 'pause', description: 'Pause alerts without losing your list' },
   { command: 'resume', description: 'Resume alerts' },
   { command: 'help', description: 'How this bot works' }
@@ -60,12 +61,8 @@ export async function handleCommand(env, msg, user) {
     case 'whoami': return send(env, chatId, `Your Telegram chat ID is <code>${chatId}</code>`)
     case 'testalert': return sendTestAlert(env, chatId, user)
 
-    case 'amullogin':
-      if (!isAdmin(env, chatId)) return
-      return showLogin(env, msg, args)
-    case 'amullogout':
-      if (!isAdmin(env, chatId)) return
-      return removeLogin(env, chatId)
+    case 'amullogin': return showLogin(env, msg, args)
+    case 'amullogout': return removeLogin(env, chatId)
 
     case 'stats': {
       if (!isAdmin(env, chatId)) return

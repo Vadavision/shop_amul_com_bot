@@ -1,30 +1,35 @@
 /**
- * Auto add-to-cart, on the owner's own Amul account.
+ * Auto add-to-cart, on each user's own Amul account.
  *
- * Amul only keeps a cart for the browser that made it, so a cart the bot builds
- * as a guest can never reliably reach the owner. Instead the bot signs in as
- * the owner with their login cookie and fills the cart on their account, which
- * any browser shows once they log in. It only ever adds to the cart: paying is
- * always the owner's own step.
+ * Amul only keeps a guest cart for the browser that made it, and clears it when
+ * the store is chosen, so a cart the bot builds as a guest cannot reliably reach
+ * anyone. Instead each user who wants it gives the bot their Amul login with
+ * /amullogin, and the bot fills the cart on their account, which every browser
+ * they log in on shows. It only ever adds to a cart: paying is always theirs.
  *
- * The cookie is Amul's `jsessionid`. It is HttpOnly, so no page script can read
- * it; the owner pastes it with /amullogin. Amul pushes its expiry a week out
- * each time it is used, so a daily check keeps it alive for as long as the bot
- * runs, and a dead one is reported rather than silently ignored.
+ * The login is Amul's `jsessionid` cookie. It is HttpOnly, so no page script or
+ * link can read it; the user pastes it. It is stored encrypted and bound to the
+ * user (crypto.js). Amul pushes its expiry a week out each time it is used, so a
+ * keep-alive uses every login at least every 12 hours, and a login that has died
+ * is reported to its owner rather than silently ignored.
  */
 import { AmulSession, isInStock } from './amul.js'
 import { send } from './telegram.js'
 import * as db from './db.js'
-
-export const LOGIN_KEY = 'amul_login'
-
-// Using the cookie is what keeps it alive, so use it at least this often.
-const KEEP_ALIVE_MS = 12 * 60 * 60 * 1000
+import { encrypt, decrypt } from './crypto.js'
 
 export class LoginExpiredError extends Error {
   constructor() {
     super('The saved Amul login is no longer signed in')
     this.name = 'LoginExpiredError'
+  }
+}
+
+/** Something the user has to fix on Amul's side; retrying will not help. */
+export class CartSkipError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'CartSkipError'
   }
 }
 
@@ -35,19 +40,7 @@ export function parseJsessionid(text) {
   return /^[\w%.+/=:-]{40,}$/.test(value) ? value : null
 }
 
-/** The saved login, or null when there is none or it is known to be dead. */
-export function activeLogin(state) {
-  const row = state.meta.get(LOGIN_KEY)
-  if (!row) return null
-  try {
-    const login = JSON.parse(row.value)
-    return login.jsessionid && !login.expired ? login : null
-  } catch {
-    return null
-  }
-}
-
-const storeVersionOf = (state) => Number(state.meta.get('store_version')?.value) || 6
+const storeVersionOf = (state) => Number(state?.meta.get('store_version')?.value) || 6
 
 /** A session signed in with this cookie, or LoginExpiredError if Amul no longer accepts it. */
 export async function openLogin(jsessionid, storeVersion = 6) {
@@ -56,62 +49,77 @@ export async function openLogin(jsessionid, storeVersion = 6) {
   return session
 }
 
+/** Check a pasted cookie and, if it is signed in, store it encrypted for this chat. */
+export async function saveLogin(env, chatId, jsessionid) {
+  const session = await openLogin(jsessionid)
+  await db.putLogin(env, chatId, await encrypt(env, chatId, jsessionid))
+  return session.account
+}
+
+/** This user's signed-in session, or null if they have no working login saved. */
+async function sessionFor(env, state, chatId) {
+  const row = await db.getLogin(env, chatId)
+  if (!row || row.expired) return null
+  return openLogin(await decrypt(env, chatId, row.jsessionid), storeVersionOf(state))
+}
+
 /**
- * Put these SKUs, if they are still in stock, into the owner's cart.
- * Returns the items that went in.
+ * Put these SKUs, if they are still in stock, into this user's Amul cart.
+ * Returns the items that went in, or null if the user has no working login.
  */
-export async function addToAccountCart(state, login, { substore, skus }) {
-  const session = await openLogin(login.jsessionid, storeVersionOf(state))
+export async function addToAccountCart(env, state, { chatId, substore, skus }) {
+  const session = await sessionFor(env, state, chatId)
+  if (!session) return null
   const { store, cartId } = session.account
 
-  // The account shops in one store, and stock and prices are per store. Items
-  // from another one would land in the cart and then fail at checkout.
-  if (store !== substore) throw new Error(`your Amul account is set to ${store}, not ${substore}`)
-  if (!cartId) throw new Error('your Amul account has no cart id')
+  // An account shops in one store, and stock and prices are per store. Items
+  // from another would sit in the cart and then fail at checkout.
+  if (store !== substore) {
+    throw new CartSkipError(`Your Amul account is set to the <b>${store}</b> store, but you watch <b>${substore}</b>. Set the same pincode on shop.amul.com and the cart will fill next time.`)
+  }
+  if (!cartId) throw new Error('the Amul account has no cart id')
 
   const items = (await session.products({ skus, raw: true })).filter(isInStock)
   for (const product of items) {
     const { cart } = await session.addToCart(product, { cartId })
     // A cart that is not the customer's would mean the sign-in did not hold.
     if (!cart?.items?.some((i) => i.sku === product.sku) || !(cart.email_id || cart.phone)) {
-      throw new Error(`${product.sku} did not land in your account cart`)
+      throw new Error(`${product.sku} did not land in the account cart`)
     }
   }
   return items
 }
 
-/** Remember that the login is dead and tell the owner, once. */
-export async function reportExpired(env, state, login) {
-  const dead = { ...login, expired: true }
-  await db.putMeta(env, LOGIN_KEY, JSON.stringify(dead))
-  state.meta.set(LOGIN_KEY, { value: JSON.stringify(dead), updated_at: Date.now() })
-  if (!env.ADMIN_CHAT_ID) return
+/** Mark a login dead and tell its owner, once. */
+export async function reportExpired(env, chatId) {
+  await db.markLogin(env, chatId, { expired: true })
   await send(
     env,
-    env.ADMIN_CHAT_ID,
+    chatId,
     [
-      '🔑 <b>Amul login expired</b>',
+      '🔑 <b>Your Amul login expired</b>',
       '',
-      'Restock alerts still work, but the cart is not being filled for you.',
-      'Log in at shop.amul.com, copy your <code>jsessionid</code> cookie and send <code>/amullogin &lt;cookie&gt;</code>.'
+      'Restock alerts still come, but I can no longer add things to your Amul cart.',
+      'Send /amullogin to see how to give me a fresh one.'
     ].join('\n')
   )
 }
 
 /**
- * Use the saved login now and then so Amul keeps extending it, and find out
- * it has died before a restock does.
+ * Use the login checked longest ago, if it is due, so Amul keeps extending it
+ * and a dead one is found before a restock needs it. One per firing keeps the
+ * cost flat however many users there are.
  */
 export async function keepLoginAlive(env, state) {
-  const login = activeLogin(state)
-  if (!login || Date.now() - (login.checkedAt ?? login.savedAt) < KEEP_ALIVE_MS) return false
+  const chatId = state.loginDue
+  if (chatId === null || chatId === undefined) return false
   try {
-    await openLogin(login.jsessionid, storeVersionOf(state))
+    if (!(await sessionFor(env, state, chatId))) return false
   } catch (err) {
     if (!(err instanceof LoginExpiredError)) throw err
-    await reportExpired(env, state, login)
+    await reportExpired(env, chatId)
     return true
   }
-  await db.putMeta(env, LOGIN_KEY, JSON.stringify({ ...login, checkedAt: Date.now() }))
+  await db.markLogin(env, chatId, { checkedAt: Date.now() })
   return true
 }

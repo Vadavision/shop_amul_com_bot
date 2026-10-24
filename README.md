@@ -80,24 +80,34 @@ That registers the webhook and the command menu. Now message your bot `/start`.
 
 ## Auto add to cart
 
-With `AUTO_CART = "1"`, when something **you** (the admin) watch comes back in
-stock, the bot also adds it to your Amul cart and puts an **Open cart &
-checkout** button on the alert. You log in on any browser and finish the order;
-the bot never pays.
+With `AUTO_CART = "1"`, any user can opt in with `/amullogin`. When something
+they watch comes back in stock, the bot adds it to **their own** Amul cart and
+puts an **Open cart & checkout** button on their alert. They log in on any
+browser and finish the order; the bot never pays.
 
-Amul only keeps a guest cart for the browser that made it, so the bot signs in
-as you instead:
+Amul only keeps a guest cart for the browser that made it, and clears it when a
+pincode is chosen, so the bot signs in as each user instead. `/amullogin` with no
+arguments shows the steps: log in at shop.amul.com on a computer, press F12 →
+Network, reload, copy the `cookie` request header, send `/amullogin <paste>`.
+The bot checks it, stores it, and deletes the message. `/amullogout` forgets it.
+`jsessionid` is HttpOnly, so no link or bookmarklet can read it; pasting is the
+way.
 
-1. Log in at shop.amul.com on a computer, press F12 → Network, reload, click the
-   first `shop.amul.com` request, and copy the whole `cookie` request header.
-2. Send the bot `/amullogin <paste>`. It checks the cookie, saves it, and
-   deletes your message.
+Logins are stored encrypted (AES-GCM, `src/crypto.js`), each bound to its user,
+with a key that exists only as a Worker secret:
 
-`jsessionid` is HttpOnly, so no bookmarklet can read it; pasting is the way.
-Amul extends it a week each time it is used and the bot uses it at least every
-12 hours, so it lasts as long as the bot runs. If it dies you get a message.
-`/amullogout` forgets it. It is stored in D1 (`meta`), so treat the database
-like a password.
+```bash
+openssl rand -base64 32 | npx wrangler secret put LOGIN_ENC_KEY
+```
+
+Without it the bot refuses to store logins. Losing or changing it means everyone
+sends `/amullogin` again. It does not protect against someone who can read the
+Worker's secrets.
+
+Amul extends a login a week each time it is used, and the bot uses each one at
+least every 12 hours (one per minute at most), so logins last as long as the bot
+runs. A dead one, or an account set to a different store than the user watches,
+is reported to that user.
 
 ## Access control
 

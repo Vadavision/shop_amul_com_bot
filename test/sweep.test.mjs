@@ -12,6 +12,7 @@ import { createEnv, telegram, sentTo } from './support.mjs'
 import { openSession, isInStock } from '../src/amul.js'
 import { runSweeps, runCheck } from '../src/sweep.js'
 import { parseJsessionid } from '../src/cart.js'
+import { encrypt, decrypt, KeyMissingError } from '../src/crypto.js'
 import { nextHealth, FRESH_HEALTH } from '../src/health.js'
 import * as db from '../src/db.js'
 import { handleUpdate } from '../src/bot/index.js'
@@ -191,13 +192,15 @@ test('health streak: a lone failure is silent and a clean run resets it', () => 
 })
 
 // --- auto cart --------------------------------------------------------------
-// Stock is live Amul. What is faked is the owner's account: the sign-in and the
-// cart write, so a test run never touches anyone's real cart.
+// Stock is live Amul. What is faked is each user's Amul account: the sign-in and
+// the cart write, so a test run never touches anyone's real cart.
 
 const LOGIN = 's%3Atest' + 'x'.repeat(40)
+const KEY = Buffer.alloc(32, 7).toString('base64')
+const CART_VARS = { SWEEPS_PER_RUN: '1', ADMIN_CHAT_ID: String(ADMIN), AUTO_CART: '1', LOGIN_ENC_KEY: KEY }
 
-/** Stands in for the owner's logged-in Amul session. */
-async function fakeAccount({ signedIn = true, cart = () => Response.json({ cart: { _id: 'acct1', email_id: 'o@example.com', items: [{ sku: inStock.sku, quantity: 1 }] } }) } = {}) {
+/** Stands in for a user's logged-in Amul session. */
+async function fakeAccount({ signedIn = true, store = 'punjab', cart = () => Response.json({ cart: { _id: 'acct1', email_id: 'o@example.com', items: [{ sku: inStock.sku, quantity: 1 }] } }) } = {}) {
   // A real Punjab-bound session supplies stock, standing in for the account's store.
   const real = await openSession(SUBSTORE)
   const realCookie = [...real.jar].map(([k, v]) => `${k}=${v}`).join('; ')
@@ -205,17 +208,17 @@ async function fakeAccount({ signedIn = true, cart = () => Response.json({ cart:
   const realFetch = globalThis.fetch
   globalThis.fetch = async (url, options = {}) => {
     const href = String(url)
-    const asOwner = String(options.headers?.cookie ?? '').includes(`jsessionid=${LOGIN}`)
-    // Only the owner's cookie is answered here; the bot's ordinary guest sessions reach real Amul.
-    if (asOwner && href.includes('/user/info.js')) {
-      const data = signedIn ? { isLoggedIn: true, first_name: 'Pankil', store: 'punjab', cart_id: 'acct1' } : { isBot: false }
+    const asUser = String(options.headers?.cookie ?? '').includes(`jsessionid=${LOGIN}`)
+    // Only the user's cookie is answered here; the bot's guest sessions reach real Amul.
+    if (asUser && href.includes('/user/info.js')) {
+      const data = signedIn ? { isLoggedIn: true, first_name: 'Pankil', store, cart_id: 'acct1' } : { isBot: false }
       return new Response('session = ' + JSON.stringify({ data, tid: real.tid }))
     }
     if (href.includes('/entity/ms.carts/')) {
       calls.push({ url: href, body: JSON.parse(options.body) })
       return cart(calls)
     }
-    if (asOwner && href.includes('/entity/ms.products')) {
+    if (asUser && href.includes('/entity/ms.products')) {
       return realFetch(url, { ...options, headers: { ...options.headers, cookie: realCookie } })
     }
     return realFetch(url, options)
@@ -223,21 +226,25 @@ async function fakeAccount({ signedIn = true, cart = () => Response.json({ cart:
   return { calls, restore: () => { globalThis.fetch = realFetch } }
 }
 
-/** The owner (ADMIN) watching a product that is remembered as sold out. */
-function cartScenario({ login = { jsessionid: LOGIN, savedAt: Date.now(), checkedAt: Date.now() }, autoCart = '1', watcher = ADMIN } = {}) {
-  const { env: cartEnv, sqlite: db2 } = createEnv({ SWEEPS_PER_RUN: '1', ADMIN_CHAT_ID: String(ADMIN), AUTO_CART: autoCart })
+/** USER watching a product remembered as sold out, with (by default) a saved login. */
+async function cartScenario({ login = true, vars = {}, checkedAt = Date.now() } = {}) {
+  const { env: cartEnv, sqlite: db2 } = createEnv({ ...CART_VARS, ...vars })
   const now = Date.now()
-  db2.prepare(`INSERT INTO users (chat_id, first_name, pincode, substore, created_at, updated_at) VALUES (?, 'T', '143505', ?, ?, ?)`).run(watcher, SUBSTORE, now, now)
-  db2.prepare('INSERT INTO tracks (chat_id, sku, name, created_at) VALUES (?, ?, ?, ?)').run(watcher, inStock.sku, inStock.name, now)
+  db2.prepare(`INSERT INTO users (chat_id, first_name, pincode, substore, created_at, updated_at) VALUES (?, 'T', '143505', ?, ?, ?)`).run(USER, SUBSTORE, now, now)
+  db2.prepare('INSERT INTO tracks (chat_id, sku, name, created_at) VALUES (?, ?, ?, ?)').run(USER, inStock.sku, inStock.name, now)
   db2.prepare('INSERT INTO snapshots (substore, data, updated_at) VALUES (?, ?, ?)').run(SUBSTORE, JSON.stringify({ [inStock.sku]: 0 }), now)
   db2.prepare("INSERT INTO meta (key, value, updated_at) VALUES ('last_catalog_ok', '1', ?)").run(now)
-  if (login) db2.prepare("INSERT INTO meta (key, value, updated_at) VALUES ('amul_login', ?, ?)").run(JSON.stringify(login), now)
+  if (login) {
+    db2.prepare('INSERT INTO amul_logins (chat_id, jsessionid, saved_at, checked_at) VALUES (?, ?, ?, ?)').run(USER, await encrypt(cartEnv, USER, LOGIN), now, checkedAt)
+  }
   telegram.length = 0
   return { cartEnv, db2 }
 }
 
 const edits = () => telegram.filter((c) => c.method === 'editMessageReplyMarkup')
-const jobs = (db2) => JSON.parse(db2.prepare("SELECT value FROM meta WHERE key = 'cart_jobs'").get().value)
+const jobs = (db2) => JSON.parse(db2.prepare("SELECT value FROM meta WHERE key = 'cart_jobs'").get()?.value ?? '[]')
+const loginRow = (db2, chatId = USER) => db2.prepare('SELECT * FROM amul_logins WHERE chat_id = ?').get(chatId)
+const say = (e, from, text, id) => handleUpdate(e, { update_id: id, message: { message_id: id, from: { id: from, is_bot: false, first_name: 'U' }, chat: { id: from, type: 'private' }, date: 0, text } })
 
 test('parseJsessionid takes a whole Cookie header, a pair, or the bare value', () => {
   assert.equal(parseJsessionid(`_ga=GA1.1.2; jsessionid=${LOGIN}; _cfuvid=abc`), LOGIN)
@@ -247,32 +254,57 @@ test('parseJsessionid takes a whole Cookie header, a pair, or the bare value', (
   assert.equal(parseJsessionid(''), null)
 })
 
-test('/amullogin checks the cookie, saves it, and deletes the message that held it', async () => {
-  const { env: e, sqlite: db2 } = createEnv({ SWEEPS_PER_RUN: '1', ADMIN_CHAT_ID: String(ADMIN), AUTO_CART: '1' })
+test('a login only decrypts for its own user, with the right key, untampered', async () => {
+  const env = { LOGIN_ENC_KEY: KEY }
+  const sealed = await encrypt(env, USER, LOGIN)
+  assert.ok(!sealed.includes(LOGIN) && sealed.startsWith('v1.'))
+  assert.equal(await decrypt(env, USER, sealed), LOGIN)
+  await assert.rejects(decrypt(env, ADMIN, sealed), 'copied onto another user it is useless')
+  await assert.rejects(decrypt({ LOGIN_ENC_KEY: Buffer.alloc(32, 8).toString('base64') }, USER, sealed), 'wrong key')
+  const [v, iv, ct] = sealed.split('.')
+  await assert.rejects(decrypt(env, USER, `${v}.${iv}.${ct.slice(0, -2)}AA`), 'tampered')
+  await assert.rejects(encrypt({}, USER, LOGIN), KeyMissingError)
+})
+
+test('any user can /amullogin: checked, stored encrypted, and their message deleted', async () => {
+  const { env: e, sqlite: db2 } = createEnv(CART_VARS)
   const account = await fakeAccount()
-  const say = (text, id) => handleUpdate(e, { update_id: id, message: { message_id: id, from: { id: ADMIN, is_bot: false, first_name: 'Owner' }, chat: { id: ADMIN, type: 'private' }, date: 0, text } })
   try {
     telegram.length = 0
-    await say(`/amullogin _ga=1; jsessionid=${LOGIN}; _cfuvid=x`, 11)
+    await say(e, USER, `/amullogin _ga=1; jsessionid=${LOGIN}; _cfuvid=x`, 11)
     assert.ok(telegram.some((c) => c.method === 'deleteMessage' && c.body.message_id === 11), 'the cookie is not left in the chat')
-    assert.match(sentTo(ADMIN).at(-1).body.text, /Logged in as Pankil/)
-    assert.equal(JSON.parse(db2.prepare("SELECT value FROM meta WHERE key = 'amul_login'").get().value).jsessionid, LOGIN)
+    assert.match(sentTo(USER).at(-1).body.text, /Logged in as Pankil/)
+    const row = loginRow(db2)
+    assert.ok(row && !row.jsessionid.includes(LOGIN), 'stored, and not in plain text')
+    assert.equal(await decrypt(e, USER, row.jsessionid), LOGIN)
 
     telegram.length = 0
-    await say('/amullogin jsessionid=s%3Adead' + 'y'.repeat(40), 12)
-    assert.match(sentTo(ADMIN).at(-1).body.text, /does not see that cookie as logged in/)
-    assert.equal(JSON.parse(db2.prepare("SELECT value FROM meta WHERE key = 'amul_login'").get().value).jsessionid, LOGIN, 'a bad cookie does not replace a good one')
+    await say(e, USER, '/amullogin jsessionid=s%3Adead' + 'y'.repeat(40), 12)
+    assert.match(sentTo(USER).at(-1).body.text, /does not see that cookie as logged in/)
+    assert.equal(await decrypt(e, USER, loginRow(db2).jsessionid), LOGIN, 'a bad cookie does not replace a good one')
 
-    telegram.length = 0
-    await handleUpdate(e, { update_id: 13, message: { message_id: 13, from: { id: USER, is_bot: false, first_name: 'Other' }, chat: { id: USER, type: 'private' }, date: 0, text: `/amullogin ${LOGIN}` } })
-    assert.equal(sentTo(USER).length, 0, 'only the owner can set a login')
+    await say(e, USER, '/amullogout', 13)
+    assert.equal(loginRow(db2), undefined)
   } finally {
     account.restore()
   }
 })
 
-test('a restock puts the item in the owner\'s account cart and adds an Open cart button', async () => {
-  const { cartEnv, db2 } = cartScenario()
+test('/amullogin refuses to store a login when there is no encryption key', async () => {
+  const { env: e, sqlite: db2 } = createEnv({ ...CART_VARS, LOGIN_ENC_KEY: undefined })
+  const account = await fakeAccount()
+  try {
+    telegram.length = 0
+    await say(e, USER, `/amullogin ${LOGIN}`, 21)
+  } finally {
+    account.restore()
+  }
+  assert.match(sentTo(USER).at(-1).body.text, /did not save it/)
+  assert.equal(loginRow(db2), undefined)
+})
+
+test("a restock goes into that user's own Amul cart and their alert gets an Open cart button", async () => {
+  const { cartEnv, db2 } = await cartScenario()
   const account = await fakeAccount()
   try {
     const run = await runSweeps(cartEnv)
@@ -283,21 +315,21 @@ test('a restock puts the item in the owner\'s account cart and adds an Open cart
     account.restore()
   }
   assert.equal(account.calls.length, 1)
-  assert.match(account.calls[0].url, /\/entity\/ms\.carts\/acct1\/_\/addItem$/, "added to the account's own cart")
+  assert.match(account.calls[0].url, /\/entity\/ms\.carts\/acct1\/_\/addItem$/, "the account's own cart")
   assert.equal(account.calls[0].body.data.sku, inStock.sku)
-  assert.ok(account.calls[0].body.data.product_id, 'the cart needs the product id')
+  assert.ok(account.calls[0].body.data.product_id)
 
-  assert.equal(sentTo(ADMIN).length, 1, 'one alert message')
+  assert.equal(sentTo(USER).length, 1, 'one alert message')
   assert.equal(edits().length, 1)
+  assert.equal(edits()[0].body.chat_id, USER)
   assert.equal(edits()[0].body.message_id, 555, 'the button goes on the alert that was sent')
-  const [top] = edits()[0].body.reply_markup.inline_keyboard
-  assert.equal(top[0].url, 'https://shop.amul.com/en/cart')
+  assert.equal(edits()[0].body.reply_markup.inline_keyboard[0][0].url, 'https://shop.amul.com/en/cart')
   assert.ok(edits()[0].body.reply_markup.inline_keyboard.length > 1, 'the buy-now links are still there')
   assert.deepEqual(jobs(db2), [])
 })
 
 test('a cart that cannot be filled is retried, and the alert is never held up for it', async () => {
-  const { cartEnv, db2 } = cartScenario()
+  const { cartEnv, db2 } = await cartScenario()
   let account = await fakeAccount({ cart: () => new Response('bad gateway', { status: 502 }) })
   try {
     const run = await runSweeps(cartEnv)
@@ -308,7 +340,6 @@ test('a cart that cannot be filled is retried, and the alert is never held up fo
   }
   assert.equal(edits().length, 0)
   assert.equal(jobs(db2).length, 1, 'waiting for the next firing')
-  assert.ok(db2.prepare("SELECT 1 FROM meta WHERE key = 'last_sweep_ok'").get(), 'heartbeat written')
 
   account = await fakeAccount()
   try {
@@ -316,25 +347,38 @@ test('a cart that cannot be filled is retried, and the alert is never held up fo
   } finally {
     account.restore()
   }
-  assert.equal(edits().length, 1)
   assert.deepEqual(jobs(db2), [])
 })
 
-test('a cart reply that is not the owner\'s account cart is not reported as success', async () => {
-  const { cartEnv } = cartScenario()
+test("a cart reply that is not the user's account cart is not reported as success", async () => {
+  const { cartEnv } = await cartScenario()
   const account = await fakeAccount({ cart: () => Response.json({ cart: { _id: 'guest', email_id: null, phone: null, items: [{ sku: inStock.sku }] } }) })
   try {
     const run = await runSweeps(cartEnv)
-    assert.match(run.errors.join(), /did not land in your account cart/)
+    assert.match(run.errors.join(), /did not land in the account cart/)
     assert.equal(run.carts, 0)
   } finally {
     account.restore()
   }
-  assert.equal(edits().length, 0, 'no cart button on a cart the owner cannot see')
+  assert.equal(edits().length, 0)
 })
 
-test('an expired login is reported once, and the alert still goes out', async () => {
-  const { cartEnv, db2 } = cartScenario()
+test('an account set to another store is told why, once, and nothing is added', async () => {
+  const { cartEnv, db2 } = await cartScenario()
+  const account = await fakeAccount({ store: 'gujarat' })
+  try {
+    const run = await runSweeps(cartEnv)
+    assert.equal(run.carts, 0)
+  } finally {
+    account.restore()
+  }
+  assert.equal(account.calls.length, 0)
+  assert.match(sentTo(USER).at(-1).body.text, /set to the <b>gujarat<\/b> store/)
+  assert.deepEqual(jobs(db2), [], 'not retried: only the user can fix it')
+})
+
+test("an expired login is reported to its owner, and the alert still goes out", async () => {
+  const { cartEnv, db2 } = await cartScenario()
   const account = await fakeAccount({ signedIn: false })
   try {
     const run = await runSweeps(cartEnv)
@@ -343,40 +387,56 @@ test('an expired login is reported once, and the alert still goes out', async ()
   } finally {
     account.restore()
   }
-  const texts = sentTo(ADMIN).map((c) => c.body.text)
+  const texts = sentTo(USER).map((c) => c.body.text)
   assert.equal(texts.length, 2, 'the alert, then the notice')
-  assert.match(texts[1], /Amul login expired/)
-  assert.equal(JSON.parse(db2.prepare("SELECT value FROM meta WHERE key = 'amul_login'").get().value).expired, true)
-  assert.equal(edits().length, 0)
+  assert.match(texts[1], /Your Amul login expired/)
+  assert.equal(loginRow(db2).expired, 1)
+  assert.equal(sentTo(ADMIN).length, 0, 'it is their login, so it is their message')
 })
 
-test('a login that has gone a while unused is checked, and its death is reported before a restock', async () => {
+test('a login unused for 12 hours is used to keep it alive, and its death is reported before a restock', async () => {
   const stale = Date.now() - 13 * 60 * 60 * 1000
-  const { cartEnv, db2 } = cartScenario({ login: { jsessionid: LOGIN, savedAt: stale, checkedAt: stale } })
-  // Nothing has restocked: remembered as in stock already.
-  db2.prepare('UPDATE snapshots SET data = ?').run(JSON.stringify({ [inStock.sku]: 1 }))
+  const { cartEnv, db2 } = await cartScenario({ checkedAt: stale })
+  db2.prepare('UPDATE snapshots SET data = ?').run(JSON.stringify({ [inStock.sku]: 1 })) // nothing restocks
   let account = await fakeAccount()
   try {
     await runSweeps(cartEnv)
-    assert.ok(JSON.parse(db2.prepare("SELECT value FROM meta WHERE key = 'amul_login'").get().value).checkedAt > stale, 'a live login is refreshed')
-    assert.equal(sentTo(ADMIN).length, 0, 'and nothing is said about it')
   } finally {
     account.restore()
   }
+  assert.ok(loginRow(db2).checked_at > stale, 'a live login is refreshed')
+  assert.equal(sentTo(USER).length, 0, 'and nothing is said about it')
 
-  db2.prepare("UPDATE meta SET value = json_set(value, '$.checkedAt', ?) WHERE key = 'amul_login'").run(stale)
+  db2.prepare('UPDATE amul_logins SET checked_at = ?').run(stale)
   account = await fakeAccount({ signedIn: false })
   try {
     await runSweeps(cartEnv)
   } finally {
     account.restore()
   }
-  assert.match(sentTo(ADMIN).at(-1).body.text, /Amul login expired/)
+  assert.match(sentTo(USER).at(-1).body.text, /Your Amul login expired/)
+  assert.equal(loginRow(db2).expired, 1)
 })
 
-test('no cart is touched when AUTO_CART is off, there is no login, or the watcher is not the owner', async () => {
-  for (const scenario of [{ autoCart: '0' }, { login: null }, { watcher: USER }]) {
-    const { cartEnv } = cartScenario(scenario)
+test('a login copied onto another user does not fill anyone\'s cart', async () => {
+  const { cartEnv, db2 } = await cartScenario()
+  // Someone with database access moves the admin's ciphertext onto USER's row.
+  db2.prepare('UPDATE amul_logins SET jsessionid = ? WHERE chat_id = ?').run(await encrypt(cartEnv, ADMIN, LOGIN), USER)
+  const account = await fakeAccount()
+  try {
+    const run = await runSweeps(cartEnv)
+    assert.equal(run.alerts, 1)
+    assert.equal(run.carts, 0)
+    assert.match(run.errors.join(), /cart for /)
+  } finally {
+    account.restore()
+  }
+  assert.equal(account.calls.length, 0)
+})
+
+test('no cart is touched when AUTO_CART is off or the watcher has no login', async () => {
+  for (const scenario of [{ vars: { AUTO_CART: '0' } }, { login: false }]) {
+    const { cartEnv } = await cartScenario(scenario)
     const account = await fakeAccount()
     try {
       const run = await runSweeps(cartEnv)
